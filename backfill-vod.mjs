@@ -28,9 +28,11 @@ const VOD_PAGES = Number(process.env.VOD_PAGES || 3);
 // 最老翻到 2019-03。所以默认给**每一条**都取地址（VOD_PLAY 设得很大即可），做到「场场可点播」。
 // 取址是串行的瓶颈（单条约 2.4s），故单人也开并发：VOD_PLAY_CONC。
 const VOD_PLAY = Number(process.env.VOD_PLAY || 999);
-const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 5);
+// 实测并发一大代理就 502 ⇒ 熔断 ⇒ 全直连 403（第 1 批只取到 26% 可播）。
+// 故压低并发求稳：人级 6 × 单人内 3 ≈ 18 并发。
+const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 3);
 const VOD_KEEP = Number(process.env.VOD_KEEP || 60);
-const CONC = Number(process.env.VOD_CONC || 10);
+const CONC = Number(process.env.VOD_CONC || 6);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
@@ -139,6 +141,16 @@ async function worker() {
       }
       const list = raw.slice(0, VOD_KEEP);
       if (list.length) {
+        // 库里已经有地址的场次**不再取第二遍**：重跑时只补漏（上一轮失败的那批），
+        // 否则同一批 60 场每轮都要重新打 60 次接口，既慢又容易把代理再打挂。
+        const have = new Map();
+        try {
+          const prev = await (await site('/api/vod?id=' + uid)).json();
+          for (const o of (prev && Array.isArray(prev.list) ? prev.list : [])) {
+            if (o && o.liveId && o.play) have.set(String(o.liveId), o.play);
+          }
+        } catch (e) { /* 读不到就当全都没有 */ }
+
         const out = new Array(list.length);
         let pi = 0;
         async function playWorker() {
@@ -146,7 +158,8 @@ async function worker() {
             const k = pi++;
             if (k >= list.length) return;
             const it = list[k];
-            let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
+            let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) ||
+              have.get(String(it.liveId)) || '';
             if (!play && k < VOD_PLAY) {
               try {
                 const one = await fetchLiveOne(it.liveId);
