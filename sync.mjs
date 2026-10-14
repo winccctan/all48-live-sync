@@ -22,7 +22,7 @@
  *   ONLY_FOLLOWED=1  只抓关注的人（本地调试用）
  *   DRY=1            只打印不提交（本地调试用）
  */
-import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
+import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchLiveOneMsg48, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
 import { pocketToView, isOwnerMsg } from './lib/view.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
@@ -200,10 +200,18 @@ async function vodFor(uid) {
         const it = list[i];
         let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) || have.get(String(it.liveId)) || '';
         if (!play) {
+          // 主通道 msg48（海外直连，实测 10/10 成功、0.5s/条，且不限流）；
+          // 取不到才回退官方接口（要走国内代理，代理一抖就整批失败）。
           try {
-            const one = await fetchLiveOne(it.liveId);
-            play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
-          } catch (e) { /* 单条失败不影响整份 */ }
+            const m = await fetchLiveOneMsg48(it.liveId);
+            play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
+          } catch (e) { /* 回退官方 */ }
+          if (!play) {
+            try {
+              const one = await fetchLiveOne(it.liveId);
+              play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+            } catch (e) { /* 单条失败不影响整份 */ }
+          }
         }
         out[i] = {
           liveId: String(it.liveId),
