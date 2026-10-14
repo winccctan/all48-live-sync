@@ -22,7 +22,7 @@
  *   ONLY_FOLLOWED=1  只抓关注的人（本地调试用）
  *   DRY=1            只打印不提交（本地调试用）
  */
-import { fetchMessagePage, fetchLiveListPage, fetchLiveOne } from './lib/api.mjs';
+import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchNewestLiveId } from './lib/api.mjs';
 import { pocketToView, isOwnerMsg } from './lib/view.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
@@ -152,6 +152,77 @@ async function memberWorker() {
 await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, memberWorker));
 log(`发言：成功 ${okCount} 人 / 空 ${emptyCount} 人 / 失败 ${errCount} 人`);
 
+/* ---------- ⑤ 录播（历史回放） ----------
+   为什么不在 Worker 侧直接抓：口袋48 按 IP 地域拦，Cloudflare 出口一律 403，
+   只有这里（经国内代理）拉得到。抓到后 POST /api/vod/put 存进 R2。
+   开销控制：
+     · 关注的人每轮必抓（他们最常被点开）
+     · 其余成员分片轮转，每轮 VOD_SHARD 人，若干轮覆盖全员
+     · 每人只对最近 VOD_PLAY 条取播放地址（getLiveOne），更早的只留条目
+*/
+const VOD_FOLLOW_MAX = Number(process.env.VOD_FOLLOW_MAX || 40);
+const VOD_SHARD = Number(process.env.VOD_SHARD || 12);
+const VOD_PLAY = Number(process.env.VOD_PLAY || 4);
+const VOD_KEEP = Number(process.env.VOD_KEEP || 20);
+let newestLiveId = '0';
+
+async function vodFor(uid) {
+  try {
+    const r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
+    const list = (r.list || []).slice(0, VOD_KEEP);
+    if (!list.length) return null;
+    const out = [];
+    for (let i = 0; i < list.length; i++) {
+      const it = list[i];
+      let play = it.playStreamPath || it.streamPath || '';
+      if (!play && i < VOD_PLAY) {
+        try { play = (await fetchLiveOne(it.liveId)).playStreamPath || ''; } catch (e) { /* 单条失败不影响整份 */ }
+      }
+      out.push({
+        liveId: String(it.liveId),
+        title: it.title || '',
+        cover: it.coverPath || it.cover || '',
+        ctime: Number(it.ctime) || 0,
+        play,
+      });
+    }
+    return { uid, list: out };
+  } catch (e) {
+    return null;
+  }
+}
+
+let vods = [];
+try {
+  newestLiveId = await fetchNewestLiveId({ groupId: 1, record: true });  // 按成员翻页的 next 起点（不能是 0）
+  const sorted = Array.from(catalog.keys()).sort((a, b) => a - b);
+  const round = Math.floor(Date.now() / 900000);
+  const start = (round * VOD_SHARD) % Math.max(1, sorted.length);
+  const shard = sorted.slice(start, start + VOD_SHARD);
+  const targets = [];
+  const seen = new Set();
+  for (const id of followed.slice(0, VOD_FOLLOW_MAX).concat(shard)) {
+    if (seen.has(id)) continue;
+    seen.add(id); targets.push(id);
+  }
+  log(`录播：本轮 ${targets.length} 人（关注 ${Math.min(followed.length, VOD_FOLLOW_MAX)} + 分片 ${VOD_SHARD}）`);
+
+  let vc = 0, vodOk = 0;
+  const VCONC = Math.max(1, Math.min(Number(process.env.VOD_CONC || 4), 8));
+  async function vodWorker() {
+    for (;;) {
+      const i = vc++;
+      if (i >= targets.length) return;
+      const r = await vodFor(targets[i]);
+      if (r) { vods.push(r); vodOk++; }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(VCONC, targets.length) }, vodWorker));
+  log(`录播：有内容 ${vodOk} 人`);
+} catch (e) {
+  log('录播抓取失败：' + e.message);
+}
+
 /* ---------- ④ 上报 ---------- */
 const payload = { live, msgs };
 const size = JSON.stringify(payload).length;
@@ -161,6 +232,7 @@ if (DRY) {
   console.log('在播:', JSON.stringify(live.map((x) => ({ u: x.userId, n: x.nickname, t: x.title, play: !!x.playStreamPath })), null, 1));
   const sample = Object.entries(msgs).find(([, v]) => v.length);
   if (sample) console.log('发言样例 [' + sample[0] + ']:', JSON.stringify(sample[1].slice(0, 3), null, 1));
+  if (vods.length) console.log('录播样例:', JSON.stringify(vods[0].list.slice(0, 3), null, 1));
   process.exit(0);
 }
 
@@ -171,3 +243,17 @@ const res = await site('/api/ingest', {
 });
 const out = await res.json();
 log(`上报完成 ${JSON.stringify(out)} · 体积 ${(size / 1024).toFixed(1)}KB · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+/* ---------- ⑥ 录播单独上报（失败不影响发言那一份） ---------- */
+if (vods.length) {
+  try {
+    const r = await site('/api/vod/put', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+      body: JSON.stringify(vods),
+    });
+    log(`录播上报 ${JSON.stringify(await r.json())}`);
+  } catch (e) {
+    log('录播上报失败：' + e.message);
+  }
+}

@@ -1,0 +1,42 @@
+# 录播（历史回放）全量回填 —— 手动触发
+#
+# 平时由「实时同步」每轮分片带一点（关注的人每轮必抓 + 全员分片轮转），
+# 新功能刚上线、或想让每个人都立刻有回放时，手动跑一次这个。
+# 全员 500 人 ×（1 次列表 + 4 次取播放地址）约 10 分钟。
+name: 录播回填
+
+on:
+  workflow_dispatch:
+    inputs:
+      only_followed:
+        description: '填 1 = 只回填关注的人（快）'
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vod-backfill
+  cancel-in-progress: false
+
+jobs:
+  vod:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 回填录播
+        run: node backfill-vod.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          ONLY_FOLLOWED: ${{ inputs.only_followed }}
