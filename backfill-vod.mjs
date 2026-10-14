@@ -15,7 +15,9 @@
  *   VOD_KEEP         每人保留多少条录播（默认 20）
  *   VOD_CONC         并发（默认 6）
  */
-import { fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
+import {
+  fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, fetchLiveOneMsg48, pickPlayable,
+} from './lib/api.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
@@ -99,6 +101,7 @@ log('翻页起点 liveId=' + newestLiveId);
 /* ---------- 并发抓 ---------- */
 let cursor = 0, done = 0, has = 0, batch = [];
 let playN = 0, listN = 0;   // 累计：有播放地址的场数 / 总场数（验收「是否场场可点播」）
+let viaMsg48 = 0, viaPocket = 0;   // 两条取址通道各自贡献多少（判断主通道是否健康）
 
 async function flush(force) {
   if (!batch.length || (!force && batch.length < 50)) return;
@@ -161,10 +164,20 @@ async function worker() {
             let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) ||
               have.get(String(it.liveId)) || '';
             if (!play && k < VOD_PLAY) {
+              // 主通道 msg48（海外直连，稳定、快）：实测并发下也不限流。
+              // 失败才回退官方接口（走国内代理）——它是保底，别当成主力。
               try {
-                const one = await fetchLiveOne(it.liveId);
-                play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.rtmpPath]);
-              } catch (e) { /* 忽略 */ }
+                const m = await fetchLiveOneMsg48(it.liveId);
+                play = pickPlayable([m.playStreamPath, m.hlsStreamPath, m.liveStreamPath, m.streamPath]);
+                if (play) viaMsg48++;
+              } catch (e) { /* 落到下面的官方通道 */ }
+              if (!play) {
+                try {
+                  const one = await fetchLiveOne(it.liveId);
+                  play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.rtmpPath]);
+                  if (play) viaPocket++;
+                } catch (e) { /* 两条路都没取到，留空下轮再补 */ }
+              }
             }
             out[k] = {
               liveId: String(it.liveId),
@@ -193,4 +206,4 @@ async function worker() {
 
 await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, worker));
 await flush(true);
-log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
+log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 取址来源 msg48 ${viaMsg48} / 官方 ${viaPocket} · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
