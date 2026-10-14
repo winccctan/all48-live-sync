@@ -1,5 +1,5 @@
 /**
- * 48 成员档案 · 实时同步
+ * 48 成员档案 · 实时同步（全员）
  *
  * 跑在 GitHub Actions（海外 IP）—— 但口袋48 的接口按 IP 地域拦（海外一律 403），
  * 所以必须经 SCRAPE_PROXY（国内出口代理）发出请求。站点的 Cloudflare Worker
@@ -7,15 +7,19 @@
  *
  * 每轮做三件事：
  *   ① 拉全站「正在直播」列表（含每场直播的 m3u8 播放地址）
- *   ② 拉「关注并集」里每个人的最新发言
- *   ③ 把结果 POST 回站点的 /api/ingest（带 INGEST_TOKEN），落进 KV
+ *   ② 拉**全部成员**的最新发言（站点是公开的，访客关注各不同，不能只抓关注的人；
+ *      关注的人排在最前面先抓，保证他们最快刷新）
+ *   ③ POST 回站点的 /api/ingest（带 INGEST_TOKEN）：
+ *      · 更新 hot:all 热窗（即时展示用）
+ *      · 同时把新发言并进每人的 gap:<uid> 永久存档（去重、无新增不写）
  *
  * 环境变量：
  *   SITE_URL         站点地址（机器访问走 workers.dev，避开 Cloudflare 的 bot 挑战）
  *   INGEST_TOKEN     写入口令（与 Worker 侧 env.INGEST_TOKEN 一致）
  *   POCKET48_TOKEN   口袋48 登录 token（读房间发言必需）
  *   SCRAPE_PROXY     国内出口代理（多个用逗号分隔）
- *   MAX_FOLLOW       单轮最多抓多少人的发言（默认 60）
+ *   MAX_MEMBERS      单轮最多抓多少人的发言（默认 600，即全员）
+ *   ONLY_FOLLOWED=1  只抓关注的人（本地调试用）
  *   DRY=1            只打印不提交（本地调试用）
  */
 import { fetchMessagePage, fetchLiveListPage, fetchLiveOne } from './lib/api.mjs';
@@ -24,11 +28,12 @@ import { pocketToView, isOwnerMsg } from './lib/view.mjs';
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
-const MAX_FOLLOW = Number(process.env.MAX_FOLLOW || 60);
+const MAX_MEMBERS = Number(process.env.MAX_MEMBERS || 600);
+const ONLY_FOLLOWED = !!process.env.ONLY_FOLLOWED;
 const DRY = !!process.env.DRY;
-const MSG_LIMIT = 40;      // 每人保留多少条最新发言
-const FOLLOW_MSG_LIMIT = 30; // 每人从接口取多少条原始消息
-const SLEEP = Number(process.env.SLEEP_MS || 250);
+const MSG_LIMIT = 50;      // 每人保留多少条最新发言
+const FOLLOW_MSG_LIMIT = 50; // 每人从接口取多少条原始消息
+const SLEEP = Number(process.env.SLEEP_MS || 200);
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -48,20 +53,20 @@ async function site(path, init) {
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const t0 = Date.now();
 
-/* ---------- ① 关注并集 ---------- */
-let uids = [];
+/* ---------- ① 抓取名单：全员（关注的人排最前） ---------- */
+let followed = [];
 try {
   const j = await (await site('/api/follow')).json();
-  uids = Array.isArray(j.uids) ? j.uids.map(Number).filter(Boolean) : [];
+  followed = Array.isArray(j.uids) ? j.uids.map(Number).filter(Boolean) : [];
 } catch (e) {
   log('读关注名单失败：' + e.message);
 }
 // 本地调试/指定名单：FORCE_UIDS=89653517,6737
 if (process.env.FORCE_UIDS) {
-  uids = process.env.FORCE_UIDS.split(',').map((s) => Number(s.trim())).filter(Boolean);
+  followed = process.env.FORCE_UIDS.split(',').map((s) => Number(s.trim())).filter(Boolean);
   log('（FORCE_UIDS 覆盖）');
 }
-log(`关注并集 ${uids.length} 人`);
+log(`关注并集 ${followed.length} 人`);
 
 /* ---------- 成员目录（从站点静态资源取，避免再维护一份） ---------- */
 const catalog = new Map();
@@ -73,6 +78,17 @@ try {
 } catch (e) {
   log('读成员目录失败：' + e.message);
 }
+
+// 全员名单：关注的人优先（最快刷新），其余按目录顺序补全
+let uids = followed.slice();
+if (!ONLY_FOLLOWED) {
+  const seen = new Set(uids);
+  for (const id of catalog.keys()) {
+    if (!seen.has(id)) { seen.add(id); uids.push(id); }
+  }
+}
+if (uids.length > MAX_MEMBERS) uids = uids.slice(0, MAX_MEMBERS);
+log(`本轮抓取 ${uids.length} 人` + (ONLY_FOLLOWED ? '（仅关注）' : '（全员）'));
 
 /* ---------- ② 全站正在直播 ---------- */
 const live = [];
@@ -103,9 +119,9 @@ try {
   log('拉直播列表失败：' + e.message);
 }
 
-/* ---------- ③ 关注的人的最新发言 ---------- */
+/* ---------- ③ 全员最新发言 ---------- */
 const msgs = {};
-const alive = uids.slice(0, MAX_FOLLOW);
+const alive = uids;
 let okCount = 0, emptyCount = 0, errCount = 0;
 for (const uid of alive) {
   const m = catalog.get(uid);
@@ -120,8 +136,7 @@ for (const uid of alive) {
       .filter((x) => x.t && (x.x || x.i || x.a || x.v || x.c))
       .sort((a, b) => b.t - a.t)
       .slice(0, MSG_LIMIT);
-    msgs[uid] = items;
-    if (items.length) okCount++; else emptyCount++;
+    if (items.length) { msgs[uid] = items; okCount++; } else emptyCount++;
   } catch (e) {
     errCount++;
     log(`  ${m.n} 抓取失败：` + String(e.message).slice(0, 90));

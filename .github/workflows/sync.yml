@@ -1,19 +1,20 @@
-# 48 成员档案 · 实时同步
+# 48 成员档案 · 实时同步（全员）
 #
 # 为什么要有这个仓库：口袋48 的接口按 IP 地域拦（海外出口一律 403），
 # 站点自己的 Cloudflare Worker 拉不到实时数据 —— 实测 colo=NRT 时无论带不带 pa 签名都是 403。
 # 所以由 GitHub Actions（配国内出口代理 SCRAPE_PROXY）定时抓，再 POST 回站点的 /api/ingest。
 #
-# 频率：5 分钟一轮。仓库是 public ⇒ Actions 分钟数免费，跑密一点也不会烧额度。
+# 频率：15 分钟一轮。全员 500 人抓一遍约 8 分钟，5 分钟会叠；15 分钟比较稳。
+# 仓库是 public ⇒ Actions 分钟数免费。
 name: 实时同步
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       force_uids:
-        description: '只抓这几个 uid（逗号分隔，留空=按站点关注名单）'
+        description: '只抓这几个 uid（逗号分隔，留空=全员）'
         default: ''
 
 permissions:
@@ -26,7 +27,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,4 +45,4 @@ jobs:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           FORCE_UIDS: ${{ inputs.force_uids }}
-          MAX_FOLLOW: '60'
+          MAX_MEMBERS: '600'
