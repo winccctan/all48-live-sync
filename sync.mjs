@@ -22,7 +22,7 @@
  *   ONLY_FOLLOWED=1  只抓关注的人（本地调试用）
  *   DRY=1            只打印不提交（本地调试用）
  */
-import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchNewestLiveId } from './lib/api.mjs';
+import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
 import { pocketToView, isOwnerMsg } from './lib/view.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
@@ -91,16 +91,23 @@ log(`本轮抓取 ${uids.length} 人` + (ONLY_FOLLOWED ? '（仅关注）' : '�
 
 /* ---------- ② 全站正在直播 ---------- */
 const live = [];
+let streamSample = null;   // 第一场直播的流字段快照，用来排查「到底有没有 HLS」
 try {
   // record=false ⇒ 返回「直播中」；实测 groupId 会被忽略，一次拿到全站在播
   const r = await fetchLiveListPage({ groupId: 1, next: '0', record: false });
   for (const it of r.list) {
     const u = it.userInfo || {};
     const userId = Number(u.userId) || 0;
-    let playStreamPath = '';
+    // 在播常常只给 rtmp://（浏览器放不了），接口还带 hls/flv 等字段 —— 挑一个浏览器能播的
+    let playStreamPath = '', rtmpPath = '';
     try {
       const one = await fetchLiveOne(it.liveId);
-      playStreamPath = one.playStreamPath || '';
+      playStreamPath = pickPlayable([
+        one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.playStreamPath,
+        it.playStreamPath, it.hlsStreamPath, it.streamPath,
+      ]);
+      rtmpPath = one.rtmpPath || (/^rtmp:/i.test(one.playStreamPath || '') ? one.playStreamPath : '');
+      if (!streamSample) streamSample = { liveId: String(it.liveId), keys: one.streamKeys, picked: playStreamPath };
     } catch (e) { /* 单场取流失败不影响其他 */ }
     live.push({
       liveId: String(it.liveId),
@@ -111,9 +118,12 @@ try {
       ctime: Number(it.ctime) || 0,
       onlineUserNum: Number(it.onlineUserNum) || 0,
       playStreamPath,
+      rtmpPath,     // 浏览器放不了，仅作「去 App 看」的兜底标识
     });
   }
   log(`在播 ${live.length} 场：` + live.map((x) => `${x.nickname}(${x.liveId})`).join(' / '));
+  log('可播流 ' + live.filter((x) => /^https?:/i.test(x.playStreamPath)).length + '/' + live.length +
+    ' · 首场流字段 ' + JSON.stringify(streamSample));
 } catch (e) {
   log('拉直播列表失败：' + e.message);
 }
@@ -162,7 +172,7 @@ log(`发言：成功 ${okCount} 人 / 空 ${emptyCount} 人 / 失败 ${errCount}
 */
 const VOD_FOLLOW_MAX = Number(process.env.VOD_FOLLOW_MAX || 40);
 const VOD_SHARD = Number(process.env.VOD_SHARD || 12);
-const VOD_PLAY = Number(process.env.VOD_PLAY || 4);
+const VOD_PLAY = Number(process.env.VOD_PLAY || 6);
 const VOD_KEEP = Number(process.env.VOD_KEEP || 20);
 let newestLiveId = '0';
 
@@ -174,9 +184,12 @@ async function vodFor(uid) {
     const out = [];
     for (let i = 0; i < list.length; i++) {
       const it = list[i];
-      let play = it.playStreamPath || it.streamPath || '';
+      let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
       if (!play && i < VOD_PLAY) {
-        try { play = (await fetchLiveOne(it.liveId)).playStreamPath || ''; } catch (e) { /* 单条失败不影响整份 */ }
+        try {
+          const one = await fetchLiveOne(it.liveId);
+          play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+        } catch (e) { /* 单条失败不影响整份 */ }
       }
       out.push({
         liveId: String(it.liveId),

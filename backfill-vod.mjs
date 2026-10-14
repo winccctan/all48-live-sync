@@ -15,14 +15,17 @@
  *   VOD_KEEP         每人保留多少条录播（默认 20）
  *   VOD_CONC         并发（默认 6）
  */
-import { fetchLiveListPage, fetchLiveOne, fetchNewestLiveId } from './lib/api.mjs';
+import { fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const ONLY_FOLLOWED = !!process.env.ONLY_FOLLOWED;
-const VOD_PLAY = Number(process.env.VOD_PLAY || 4);
-const VOD_KEEP = Number(process.env.VOD_KEEP || 20);
-const CONC = Number(process.env.VOD_CONC || 6);
+// 为什么原来只有 4 条历史：① 只翻了第一页（20 条）；② 只给前 4 条取了播放地址，
+// 没地址的条目前端点不开。现在默认翻 3 页（最多 60 条）+ 前 15 条都取地址。
+const VOD_PAGES = Number(process.env.VOD_PAGES || 3);
+const VOD_PLAY = Number(process.env.VOD_PLAY || 15);
+const VOD_KEEP = Number(process.env.VOD_KEEP || 60);
+const CONC = Number(process.env.VOD_CONC || 8);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
@@ -84,15 +87,34 @@ async function worker() {
     if (i >= uids.length) return;
     const uid = uids[i];
     try {
-      const r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
-      const list = (r.list || []).slice(0, VOD_KEEP);
+      // 翻页：next 用上一页返回的游标（没有就用最后一条的 liveId），直到翻够或没数据
+      const raw = [];
+      let next = newestLiveId;
+      for (let pg = 0; pg < VOD_PAGES; pg++) {
+        const r = await fetchLiveListPage({ userId: uid, next, record: true });
+        const cur = r.list || [];
+        if (!cur.length) break;
+        for (const it of cur) {
+          if (raw.some((x) => String(x.liveId) === String(it.liveId))) continue;
+          raw.push(it);
+        }
+        const nx = String(r.next || '');
+        const lastId = String(cur[cur.length - 1].liveId || '');
+        if (!nx || nx === '0' || nx === String(next) || (!cur.length)) break;
+        next = nx !== '0' ? nx : lastId;
+        if (raw.length >= VOD_KEEP) break;
+      }
+      const list = raw.slice(0, VOD_KEEP);
       if (list.length) {
         const out = [];
         for (let k = 0; k < list.length; k++) {
           const it = list[k];
-          let play = it.playStreamPath || it.streamPath || '';
+          let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
           if (!play && k < VOD_PLAY) {
-            try { play = (await fetchLiveOne(it.liveId)).playStreamPath || ''; } catch (e) { /* 忽略 */ }
+            try {
+              const one = await fetchLiveOne(it.liveId);
+              play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+            } catch (e) { /* 忽略 */ }
           }
           out.push({
             liveId: String(it.liveId),
