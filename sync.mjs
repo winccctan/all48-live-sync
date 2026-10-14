@@ -33,7 +33,6 @@ const ONLY_FOLLOWED = !!process.env.ONLY_FOLLOWED;
 const DRY = !!process.env.DRY;
 const MSG_LIMIT = 50;      // 每人保留多少条最新发言
 const FOLLOW_MSG_LIMIT = 50; // 每人从接口取多少条原始消息
-const SLEEP = Number(process.env.SLEEP_MS || 200);
 
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,30 +118,38 @@ try {
   log('拉直播列表失败：' + e.message);
 }
 
-/* ---------- ③ 全员最新发言 ---------- */
+/* ---------- ③ 全员最新发言（并发池，关注的人在最前先抓） ---------- */
 const msgs = {};
-const alive = uids;
 let okCount = 0, emptyCount = 0, errCount = 0;
-for (const uid of alive) {
-  const m = catalog.get(uid);
-  if (!m || !m.ch || !m.srv) { errCount++; continue; }
-  try {
-    const r = await fetchMessagePage({
-      serverId: m.srv, channelId: m.ch, nextTime: 0, limit: FOLLOW_MSG_LIMIT, token: TOKEN,
-    });
-    const items = r.messages
-      .filter((x) => isOwnerMsg(x, uid))
-      .map(pocketToView)
-      .filter((x) => x.t && (x.x || x.i || x.a || x.v || x.c))
-      .sort((a, b) => b.t - a.t)
-      .slice(0, MSG_LIMIT);
-    if (items.length) { msgs[uid] = items; okCount++; } else emptyCount++;
-  } catch (e) {
-    errCount++;
-    log(`  ${m.n} 抓取失败：` + String(e.message).slice(0, 90));
+let cursor = 0;
+const CONC = Number(process.env.CONC || 5);
+
+async function memberWorker() {
+  for (;;) {
+    const i = cursor++;
+    if (i >= uids.length) return;
+    const uid = uids[i];
+    const m = catalog.get(uid);
+    if (!m || !m.ch || !m.srv) { errCount++; continue; }
+    try {
+      const r = await fetchMessagePage({
+        serverId: m.srv, channelId: m.ch, nextTime: 0, limit: FOLLOW_MSG_LIMIT, token: TOKEN,
+      });
+      const items = r.messages
+        .filter((x) => isOwnerMsg(x, uid))
+        .map(pocketToView)
+        .filter((x) => x.t && (x.x || x.i || x.a || x.v || x.c))
+        .sort((a, b) => b.t - a.t)
+        .slice(0, MSG_LIMIT);
+      if (items.length) { msgs[uid] = items; okCount++; } else emptyCount++;
+    } catch (e) {
+      errCount++;
+      log(`  ${m.n} 抓取失败：` + String(e.message).slice(0, 90));
+    }
   }
-  await sleep(SLEEP);
 }
+
+await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, memberWorker));
 log(`发言：成功 ${okCount} 人 / 空 ${emptyCount} 人 / 失败 ${errCount} 人`);
 
 /* ---------- ④ 上报 ---------- */
