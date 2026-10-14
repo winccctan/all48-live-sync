@@ -17,6 +17,9 @@ on:
       uids:
         description: '只处理这几个人（逗号分隔），探测/回填都支持'
         default: ''
+      vod_play:
+        description: '每人取前几条播放地址（留空 = 全部）'
+        default: ''
       shard_n:
         description: '把全员分成几批跑（默认 5 批，每批约 8 分钟，挂了只丢一批）'
         default: '5'
@@ -65,5 +68,6 @@ jobs:
           ONLY_UIDS: ${{ inputs.uids }}
           SHARD_N: ${{ inputs.shard_n }}
           SHARD_I: ${{ inputs.shard_i }}
-          # play_all=1 ⇒ 每条都取地址（全量可点播）；否则只取前 15 条
-          VOD_PLAY: ${{ inputs.play_all == '1' && '999' || '15' }}
+          # 🔴 默认 999 = 每条都取地址（场场可点播）。
+          # 曾误写成「没传 play_all 就取前 15 条」⇒ 全员只有 25% 场次可播，排查了半天。
+          VOD_PLAY: ${{ inputs.vod_play || '999' }}
