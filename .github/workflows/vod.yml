@@ -45,9 +45,9 @@ jobs:
         with:
           node-version: '22'
 
-      - name: 探测（老回放能不能取到地址）
-        if: inputs.probe == '1'
-        run: node probe-vod-play.mjs
+      - name: 诊断 msg48 取址通道
+        if: inputs.probe == '2'
+        run: node probe-msg48.mjs
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
