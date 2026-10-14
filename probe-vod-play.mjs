@@ -56,21 +56,32 @@ async function one(uid) {
       let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
       let src = play ? 'list' : '';
       let keys = null;
+      let err = '';
       if (!play) {
         try {
           const one2 = await fetchLiveOne(it.liveId);
           play = pickPlayable([one2.playStreamPath, one2.hlsStreamPath, one2.liveStreamPath, one2.streamPath, one2.rtmpPath]);
-          if (play) src = 'getLiveOne';
+          src = play ? 'getLiveOne' : 'empty';   // 接口通了但没给地址 ⇒ 上游无源
           keys = one2.streamKeys;
-        } catch (e) { /* 忽略 */ }
+        } catch (e) { err = String((e && e.message) || e).slice(0, 100); src = 'error'; }
       }
-      rows[i] = { i, liveId: String(it.liveId), ctime: Number(it.ctime) || 0, play, src, keys };
+      rows[i] = { i, liveId: String(it.liveId), ctime: Number(it.ctime) || 0, play, src, keys, err };
     }
   }
   await Promise.all(Array.from({ length: CONC }, w));
 
   const ok = rows.filter((r) => r && r.play);
-  log(`uid ${uid}: ${raw.length} 场中 ${ok.length} 场有 http 地址 · 逐条取址耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  const empty = rows.filter((r) => r && r.src === 'empty');
+  const errs = rows.filter((r) => r && r.src === 'error');
+  log(`uid ${uid}: ${raw.length} 场中 ${ok.length} 场有 http 地址 · ` +
+    `接口通但没源 ${empty.length} · 请求报错 ${errs.length} · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  if (errs.length) {
+    const byMsg = new Map();
+    for (const r of errs) byMsg.set(r.err, (byMsg.get(r.err) || 0) + 1);
+    log('  报错分布：' + [...byMsg.entries()].map(([m, n]) => `${n}× ${m.slice(0, 60)}`).join(' | '));
+  }
+  const e0 = empty[0];
+  if (e0 && e0.keys) log(`  [没源样本 #${e0.i} ${ymd(e0.ctime)}] 原始流字段：${JSON.stringify(e0.keys)}`);
 
   // ③ 抽样：头尾 + 中段，看老场次的成色
   const picks = [0, 1, 2, 9, 14, 15, 19, 20, 29, 39, 44, 59].filter((i) => rows[i]);
