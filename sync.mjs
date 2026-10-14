@@ -168,11 +168,12 @@ log(`发言：成功 ${okCount} 人 / 空 ${emptyCount} 人 / 失败 ${errCount}
    开销控制：
      · 关注的人每轮必抓（他们最常被点开）
      · 其余成员分片轮转，每轮 VOD_SHARD 人，若干轮覆盖全员
-     · 每人只对最近 VOD_PLAY 条取播放地址（getLiveOne），更早的只留条目
+    · 取播放地址时**跳过库里已经有了的场次** —— 每轮真正需要取址的只有新增那几场，
+      否则 52 人 × 20 场 × 2.4s 会拖爆 12 分钟的时限
 */
 const VOD_FOLLOW_MAX = Number(process.env.VOD_FOLLOW_MAX || 40);
 const VOD_SHARD = Number(process.env.VOD_SHARD || 12);
-const VOD_PLAY = Number(process.env.VOD_PLAY || 6);
+const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 5);
 const VOD_KEEP = Number(process.env.VOD_KEEP || 20);
 let newestLiveId = '0';
 
@@ -181,25 +182,40 @@ async function vodFor(uid) {
     const r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
     const list = (r.list || []).slice(0, VOD_KEEP);
     if (!list.length) return null;
-    const out = [];
-    for (let i = 0; i < list.length; i++) {
-      const it = list[i];
-      let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
-      if (!play && i < VOD_PLAY) {
-        try {
-          const one = await fetchLiveOne(it.liveId);
-          play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
-        } catch (e) { /* 单条失败不影响整份 */ }
+    // 库里已有的播放地址不必再取一遍：先读一次该成员现有回放，建 liveId → play 索引
+    const have = new Map();
+    try {
+      const prev = await (await site('/api/vod?id=' + uid)).json();
+      for (const o of (prev && Array.isArray(prev.list) ? prev.list : [])) {
+        if (o && o.liveId && o.play) have.set(String(o.liveId), o.play);
       }
-      out.push({
-        liveId: String(it.liveId),
-        title: it.title || '',
-        cover: it.coverPath || it.cover || '',
-        ctime: Number(it.ctime) || 0,
-        play,
-      });
+    } catch (e) { /* 读不到就当全都没有 */ }
+
+    const out = new Array(list.length);
+    let pi = 0;
+    async function playWorker() {
+      for (;;) {
+        const i = pi++;
+        if (i >= list.length) return;
+        const it = list[i];
+        let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]) || have.get(String(it.liveId)) || '';
+        if (!play) {
+          try {
+            const one = await fetchLiveOne(it.liveId);
+            play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
+          } catch (e) { /* 单条失败不影响整份 */ }
+        }
+        out[i] = {
+          liveId: String(it.liveId),
+          title: it.title || '',
+          cover: it.coverPath || it.cover || '',
+          ctime: Number(it.ctime) || 0,
+          play,
+        };
+      }
     }
-    return { uid, list: out };
+    await Promise.all(Array.from({ length: Math.min(VOD_PLAY_CONC, list.length) }, playWorker));
+    return { uid, list: out.filter(Boolean) };
   } catch (e) {
     return null;
   }

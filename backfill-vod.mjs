@@ -24,9 +24,13 @@ const ONLY_UIDS = (process.env.ONLY_UIDS || '').split(',').map((s) => s.trim()).
 // 为什么原来只有 4 条历史：① 只翻了第一页（20 条）；② 只给前 4 条取了播放地址，
 // 没地址的条目前端点不开。现在默认翻 3 页（最多 60 条）+ 前 15 条都取地址。
 const VOD_PAGES = Number(process.env.VOD_PAGES || 3);
-const VOD_PLAY = Number(process.env.VOD_PLAY || 15);
+// 实测（2026-10-14 probe）：老回放一样能取到 http m3u8 —— uid 1 的 60 场里 **60 场可播**，
+// 最老翻到 2019-03。所以默认给**每一条**都取地址（VOD_PLAY 设得很大即可），做到「场场可点播」。
+// 取址是串行的瓶颈（单条约 2.4s），故单人也开并发：VOD_PLAY_CONC。
+const VOD_PLAY = Number(process.env.VOD_PLAY || 999);
+const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 5);
 const VOD_KEEP = Number(process.env.VOD_KEEP || 60);
-const CONC = Number(process.env.VOD_CONC || 8);
+const CONC = Number(process.env.VOD_CONC || 10);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
@@ -69,6 +73,7 @@ log('翻页起点 liveId=' + newestLiveId);
 
 /* ---------- 并发抓 ---------- */
 let cursor = 0, done = 0, has = 0, batch = [];
+let playN = 0, listN = 0;   // 累计：有播放地址的场数 / 总场数（验收「是否场场可点播」）
 
 async function flush(force) {
   if (!batch.length || (!force && batch.length < 50)) return;
@@ -111,36 +116,45 @@ async function worker() {
       }
       const list = raw.slice(0, VOD_KEEP);
       if (list.length) {
-        const out = [];
-        for (let k = 0; k < list.length; k++) {
-          const it = list[k];
-          let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
-          if (!play && k < VOD_PLAY) {
-            try {
-              const one = await fetchLiveOne(it.liveId);
-              play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath]);
-            } catch (e) { /* 忽略 */ }
+        const out = new Array(list.length);
+        let pi = 0;
+        async function playWorker() {
+          for (;;) {
+            const k = pi++;
+            if (k >= list.length) return;
+            const it = list[k];
+            let play = pickPlayable([it.playStreamPath, it.hlsStreamPath, it.streamPath]);
+            if (!play && k < VOD_PLAY) {
+              try {
+                const one = await fetchLiveOne(it.liveId);
+                play = pickPlayable([one.playStreamPath, one.hlsStreamPath, one.liveStreamPath, one.streamPath, one.rtmpPath]);
+              } catch (e) { /* 忽略 */ }
+            }
+            out[k] = {
+              liveId: String(it.liveId),
+              title: it.title || '',
+              cover: it.coverPath || it.cover || '',
+              ctime: Number(it.ctime) || 0,
+              play,
+            };
           }
-          out.push({
-            liveId: String(it.liveId),
-            title: it.title || '',
-            cover: it.coverPath || it.cover || '',
-            ctime: Number(it.ctime) || 0,
-            play,
-          });
         }
-        batch.push({ uid, list: out });
+        await Promise.all(Array.from({ length: Math.min(VOD_PLAY_CONC, list.length) }, playWorker));
+        const rows = out.filter(Boolean);
+        playN += rows.filter((x) => x.play).length;
+        listN += rows.length;
+        batch.push({ uid, list: rows });
         has++;
       }
     } catch (e) {
       // 单个人失败不影响整体
     }
     done++;
-    if (done % 50 === 0) log(`进度 ${done}/${uids.length} · 有录播 ${has} 人 · ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+    if (done % 50 === 0) log(`进度 ${done}/${uids.length} · 有录播 ${has} 人 · ${listN} 场中 ${playN} 场可播 · ${((Date.now() - t0) / 1000).toFixed(0)}s`);
     await flush(false);
   }
 }
 
 await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, worker));
 await flush(true);
-log(`完成：${uids.length} 人中 ${has} 人有录播 · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
+log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);

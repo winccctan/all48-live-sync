@@ -31,7 +31,8 @@ concurrency:
 jobs:
   vod:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 全量取址（每人最多 60 场逐条 getLiveOne）实测约 25-40 分钟，留足余量
+    timeout-minutes: 150
     steps:
       - name: Checkout
         uses: actions/checkout@v4
