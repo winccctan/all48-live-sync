@@ -20,6 +20,7 @@ import { fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, pickPlayable } from
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const ONLY_FOLLOWED = !!process.env.ONLY_FOLLOWED;
+const ONLY_UIDS = (process.env.ONLY_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
 // 为什么原来只有 4 条历史：① 只翻了第一页（20 条）；② 只给前 4 条取了播放地址，
 // 没地址的条目前端点不开。现在默认翻 3 页（最多 60 条）+ 前 15 条都取地址。
 const VOD_PAGES = Number(process.env.VOD_PAGES || 3);
@@ -48,7 +49,11 @@ try {
   uids = Array.isArray(j.uids) ? j.uids.map(Number).filter(Boolean) : [];
 } catch (e) { log('读关注名单失败：' + e.message); }
 
-if (!ONLY_FOLLOWED) {
+// 只处理指定的人：调试 / 分批改地址时用（填了它，名单就以此为准）
+if (ONLY_UIDS.length) {
+  uids = ONLY_UIDS.slice();
+  log(`只回填指定 ${uids.length} 人：${uids.join(',')}`);
+} else if (!ONLY_FOLLOWED) {
   try {
     const txt = await (await site('/data/members.js')).text();
     const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));

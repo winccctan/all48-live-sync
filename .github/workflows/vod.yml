@@ -11,6 +11,15 @@ on:
       only_followed:
         description: '填 1 = 只回填关注的人（快）'
         default: ''
+      probe:
+        description: '填 1 = 只探测「老回放能不能取到地址」，不写库'
+        default: ''
+      uids:
+        description: '只处理这几个人（逗号分隔），探测/回填都支持'
+        default: ''
+      play_all:
+        description: '填 1 = 每条录播都取播放地址（慢，但全部可点播）'
+        default: ''
 
 permissions:
   contents: read
@@ -32,7 +41,16 @@ jobs:
         with:
           node-version: '22'
 
+      - name: 探测（老回放能不能取到地址）
+        if: inputs.probe == '1'
+        run: node probe-vod-play.mjs
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          UIDS: ${{ inputs.uids }}
+
       - name: 回填录播
+        if: inputs.probe != '1'
         run: node backfill-vod.mjs
         env:
           SITE_URL: ${{ vars.SITE_URL }}
@@ -40,3 +58,6 @@ jobs:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           ONLY_FOLLOWED: ${{ inputs.only_followed }}
+          ONLY_UIDS: ${{ inputs.uids }}
+          # play_all=1 ⇒ 每条都取地址（全量可点播）；否则只取前 VOD_PLAY 条
+          VOD_PLAY: ${{ inputs.play_all == '1' && '999' || '15' }}
