@@ -17,9 +17,12 @@ on:
       uids:
         description: '只处理这几个人（逗号分隔），探测/回填都支持'
         default: ''
-      play_all:
-        description: '填 1 = 每条录播都取播放地址（慢，但全部可点播）'
-        default: ''
+      shard_n:
+        description: '把全员分成几批跑（默认 5 批，每批约 8 分钟，挂了只丢一批）'
+        default: '5'
+      shard_i:
+        description: '跑第几批（0 起）'
+        default: '0'
 
 permissions:
   contents: read
@@ -60,5 +63,7 @@ jobs:
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           ONLY_FOLLOWED: ${{ inputs.only_followed }}
           ONLY_UIDS: ${{ inputs.uids }}
-          # play_all=1 ⇒ 每条都取地址（全量可点播）；否则只取前 VOD_PLAY 条
+          SHARD_N: ${{ inputs.shard_n }}
+          SHARD_I: ${{ inputs.shard_i }}
+          # play_all=1 ⇒ 每条都取地址（全量可点播）；否则只取前 15 条
           VOD_PLAY: ${{ inputs.play_all == '1' && '999' || '15' }}

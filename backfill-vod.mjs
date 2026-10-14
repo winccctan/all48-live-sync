@@ -65,10 +65,33 @@ if (ONLY_UIDS.length) {
     for (const m of arr) { const id = Number(m.id); if (id && !seen.has(id)) { seen.add(id); uids.push(id); } }
   } catch (e) { log('读成员目录失败：' + e.message); }
 }
+// 分片：全员 500 人一次跑要 30-40 分钟，中途挂了会全丢。
+// 用 SHARD_N=5 分 5 批依次触发（每批 ~8 分钟），最坏只丢一批。
+const SHARD_I = Number(process.env.SHARD_I || 0);
+const SHARD_N = Number(process.env.SHARD_N || 1);
+if (!ONLY_UIDS.length && SHARD_N > 1) {
+  uids = uids.filter((_, i) => i % SHARD_N === SHARD_I);
+  log(`分片 ${SHARD_I + 1}/${SHARD_N} ⇒ 本批 ${uids.length} 人`);
+}
 log(`回填 ${uids.length} 人`);
 
-/* ---------- 全团最新 liveId：按成员翻页的 next 起点（不能是 0） ---------- */
-const newestLiveId = await fetchNewestLiveId({ groupId: 1, record: true });
+/* ---------- 全团最新 liveId：按成员翻页的 next 起点（不能是 0） ----------
+   🔴 必须容错重试：实测代理会偶发「CONNECT 502」，这一步抛错会让整个回填
+   还没开始就退出（500 人 0 进度）。取不到就用兜底 liveId（够新即可）。 */
+const FALLBACK_LIVEID = process.env.VOD_START_LIVEID || '1317261574995251200';
+let newestLiveId = '';
+for (let i = 0; i < 5 && !newestLiveId; i++) {
+  try {
+    newestLiveId = await fetchNewestLiveId({ groupId: 1, record: true });
+  } catch (e) {
+    log(`取翻页起点失败（第 ${i + 1} 次）：${String(e.message).slice(0, 90)}`);
+    await new Promise((r) => setTimeout(r, 4000));
+  }
+}
+if (!newestLiveId) {
+  newestLiveId = FALLBACK_LIVEID;
+  log('⚠️ 翻页起点取不到，用兜底值 ' + newestLiveId);
+}
 log('翻页起点 liveId=' + newestLiveId);
 
 /* ---------- 并发抓 ---------- */
