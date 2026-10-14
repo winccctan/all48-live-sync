@@ -1,0 +1,151 @@
+/**
+ * 48 成员档案 · 实时同步
+ *
+ * 跑在 GitHub Actions（海外 IP）—— 但口袋48 的接口按 IP 地域拦（海外一律 403），
+ * 所以必须经 SCRAPE_PROXY（国内出口代理）发出请求。站点的 Cloudflare Worker
+ * 自己是拉不到的（实测 colo=NRT 时 403），只能靠这里「搬」。
+ *
+ * 每轮做三件事：
+ *   ① 拉全站「正在直播」列表（含每场直播的 m3u8 播放地址）
+ *   ② 拉「关注并集」里每个人的最新发言
+ *   ③ 把结果 POST 回站点的 /api/ingest（带 INGEST_TOKEN），落进 KV
+ *
+ * 环境变量：
+ *   SITE_URL         站点地址（机器访问走 workers.dev，避开 Cloudflare 的 bot 挑战）
+ *   INGEST_TOKEN     写入口令（与 Worker 侧 env.INGEST_TOKEN 一致）
+ *   POCKET48_TOKEN   口袋48 登录 token（读房间发言必需）
+ *   SCRAPE_PROXY     国内出口代理（多个用逗号分隔）
+ *   MAX_FOLLOW       单轮最多抓多少人的发言（默认 60）
+ *   DRY=1            只打印不提交（本地调试用）
+ */
+import { fetchMessagePage, fetchLiveListPage, fetchLiveOne } from './lib/api.mjs';
+import { pocketToView, isOwnerMsg } from './lib/view.mjs';
+
+const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
+const INGEST = process.env.INGEST_TOKEN || '';
+const TOKEN = process.env.POCKET48_TOKEN || '';
+const MAX_FOLLOW = Number(process.env.MAX_FOLLOW || 60);
+const DRY = !!process.env.DRY;
+const MSG_LIMIT = 40;      // 每人保留多少条最新发言
+const FOLLOW_MSG_LIMIT = 30; // 每人从接口取多少条原始消息
+const SLEEP = Number(process.env.SLEEP_MS || 250);
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
+if (!DRY && !INGEST) { console.error('缺少 INGEST_TOKEN'); process.exit(1); }
+
+async function site(path, init) {
+  const res = await fetch(SITE + path, {
+    ...init,
+    headers: { 'User-Agent': UA, Accept: 'application/json', ...(init && init.headers) },
+  });
+  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+  return res;
+}
+
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+const t0 = Date.now();
+
+/* ---------- ① 关注并集 ---------- */
+let uids = [];
+try {
+  const j = await (await site('/api/follow')).json();
+  uids = Array.isArray(j.uids) ? j.uids.map(Number).filter(Boolean) : [];
+} catch (e) {
+  log('读关注名单失败：' + e.message);
+}
+// 本地调试/指定名单：FORCE_UIDS=89653517,6737
+if (process.env.FORCE_UIDS) {
+  uids = process.env.FORCE_UIDS.split(',').map((s) => Number(s.trim())).filter(Boolean);
+  log('（FORCE_UIDS 覆盖）');
+}
+log(`关注并集 ${uids.length} 人`);
+
+/* ---------- 成员目录（从站点静态资源取，避免再维护一份） ---------- */
+const catalog = new Map();
+try {
+  const txt = await (await site('/data/members.js')).text();
+  const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
+  for (const m of arr) catalog.set(Number(m.id), m);
+  log(`成员目录 ${catalog.size} 人`);
+} catch (e) {
+  log('读成员目录失败：' + e.message);
+}
+
+/* ---------- ② 全站正在直播 ---------- */
+const live = [];
+try {
+  // record=false ⇒ 返回「直播中」；实测 groupId 会被忽略，一次拿到全站在播
+  const r = await fetchLiveListPage({ groupId: 1, next: '0', record: false });
+  for (const it of r.list) {
+    const u = it.userInfo || {};
+    const userId = Number(u.userId) || 0;
+    let playStreamPath = '';
+    try {
+      const one = await fetchLiveOne(it.liveId);
+      playStreamPath = one.playStreamPath || '';
+    } catch (e) { /* 单场取流失败不影响其他 */ }
+    live.push({
+      liveId: String(it.liveId),
+      userId,
+      nickname: u.nickname || u.starName || '',
+      title: it.title || '',
+      cover: it.coverPath || '',
+      ctime: Number(it.ctime) || 0,
+      onlineUserNum: Number(it.onlineUserNum) || 0,
+      playStreamPath,
+    });
+  }
+  log(`在播 ${live.length} 场：` + live.map((x) => `${x.nickname}(${x.liveId})`).join(' / '));
+} catch (e) {
+  log('拉直播列表失败：' + e.message);
+}
+
+/* ---------- ③ 关注的人的最新发言 ---------- */
+const msgs = {};
+const alive = uids.slice(0, MAX_FOLLOW);
+let okCount = 0, emptyCount = 0, errCount = 0;
+for (const uid of alive) {
+  const m = catalog.get(uid);
+  if (!m || !m.ch || !m.srv) { errCount++; continue; }
+  try {
+    const r = await fetchMessagePage({
+      serverId: m.srv, channelId: m.ch, nextTime: 0, limit: FOLLOW_MSG_LIMIT, token: TOKEN,
+    });
+    const items = r.messages
+      .filter((x) => isOwnerMsg(x, uid))
+      .map(pocketToView)
+      .filter((x) => x.t && (x.x || x.i || x.a || x.v || x.c))
+      .sort((a, b) => b.t - a.t)
+      .slice(0, MSG_LIMIT);
+    msgs[uid] = items;
+    if (items.length) okCount++; else emptyCount++;
+  } catch (e) {
+    errCount++;
+    log(`  ${m.n} 抓取失败：` + String(e.message).slice(0, 90));
+  }
+  await sleep(SLEEP);
+}
+log(`发言：成功 ${okCount} 人 / 空 ${emptyCount} 人 / 失败 ${errCount} 人`);
+
+/* ---------- ④ 上报 ---------- */
+const payload = { live, msgs };
+const size = JSON.stringify(payload).length;
+
+if (DRY) {
+  console.log('\n[DRY] 不上报。体积 ' + (size / 1024).toFixed(1) + ' KB');
+  console.log('在播:', JSON.stringify(live.map((x) => ({ u: x.userId, n: x.nickname, t: x.title, play: !!x.playStreamPath })), null, 1));
+  const sample = Object.entries(msgs).find(([, v]) => v.length);
+  if (sample) console.log('发言样例 [' + sample[0] + ']:', JSON.stringify(sample[1].slice(0, 3), null, 1));
+  process.exit(0);
+}
+
+const res = await site('/api/ingest', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+  body: JSON.stringify(payload),
+});
+const out = await res.json();
+log(`上报完成 ${JSON.stringify(out)} · 体积 ${(size / 1024).toFixed(1)}KB · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);

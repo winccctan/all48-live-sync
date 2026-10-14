@@ -1,0 +1,10 @@
+{
+  "name": "all48-live-sync",
+  "private": true,
+  "type": "module",
+  "description": "48 成员档案 · 实时数据搬运（口袋48 → Cloudflare）",
+  "scripts": {
+    "sync": "node sync.mjs",
+    "dry": "DRY=1 node sync.mjs"
+  }
+}
