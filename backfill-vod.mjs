@@ -16,16 +16,18 @@
  *   VOD_CONC         并发（默认 6）
  */
 import {
-  fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, fetchLiveOneMsg48, pickPlayable,
+  fetchLiveListPage, fetchLiveOne, fetchNewestLiveId, fetchLiveOneMsg48, fetchLiveListPageMsg48, pickPlayable,
 } from './lib/api.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const ONLY_FOLLOWED = !!process.env.ONLY_FOLLOWED;
 const ONLY_UIDS = (process.env.ONLY_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
-// 为什么原来只有 4 条历史：① 只翻了第一页（20 条）；② 只给前 4 条取了播放地址，
-// 没地址的条目前端点不开。现在默认翻 3 页（最多 60 条）+ 前 15 条都取地址。
-const VOD_PAGES = Number(process.env.VOD_PAGES || 3);
+// 🔴 需求：回放要「每个人的全部历史」，不是最近 60 条。
+// 实测 msg48 翻到尽头：uid 1 = 9 页 139 场（最早 2016-10-27）、63555 = 49 页 927 场、
+// 王语晨 = 42 页 796 场。故页数上限给足（VOD_PAGES），保留条数不再截断（VOD_KEEP）。
+// 真正的停止条件是「接口翻不动了」（空页 / next 不变 / 整页重复），不是页数。
+const VOD_PAGES = Number(process.env.VOD_PAGES || 300);
 // 实测（2026-10-14 probe）：老回放一样能取到 http m3u8 —— uid 1 的 60 场里 **60 场可播**，
 // 最老翻到 2019-03。所以默认给**每一条**都取地址（VOD_PLAY 设得很大即可），做到「场场可点播」。
 // 取址是串行的瓶颈（单条约 2.4s），故单人也开并发：VOD_PLAY_CONC。
@@ -33,7 +35,7 @@ const VOD_PLAY = Number(process.env.VOD_PLAY || 999);
 // 实测并发一大代理就 502 ⇒ 熔断 ⇒ 全直连 403（第 1 批只取到 26% 可播）。
 // 故压低并发求稳：人级 6 × 单人内 3 ≈ 18 并发。
 const VOD_PLAY_CONC = Number(process.env.VOD_PLAY_CONC || 3);
-const VOD_KEEP = Number(process.env.VOD_KEEP || 60);
+const VOD_KEEP = Number(process.env.VOD_KEEP || 5000);
 const CONC = Number(process.env.VOD_CONC || 6);
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
@@ -102,6 +104,8 @@ log('翻页起点 liveId=' + newestLiveId);
 let cursor = 0, done = 0, has = 0, batch = [];
 let playN = 0, listN = 0;   // 累计：有播放地址的场数 / 总场数（验收「是否场场可点播」）
 let viaMsg48 = 0, viaPocket = 0;   // 两条取址通道各自贡献多少（判断主通道是否健康）
+let oldestTs = 0, oldestUid = 0;   // 全批最老的一场（验收是否翻到历史尽头）
+const dstr = (ts) => new Date(Number(ts)).toISOString().slice(0, 10);
 
 async function flush(force) {
   if (!batch.length || (!force && batch.length < 50)) return;
@@ -125,20 +129,47 @@ async function worker() {
     if (i >= uids.length) return;
     const uid = uids[i];
     try {
-      // 翻页：next 用上一页返回的游标（没有就用最后一条的 liveId），直到翻够或没数据
+      // 一路翻到历史尽头：next 用上一页返回的游标，直到接口翻不动为止。
+      // 翻页主通道 msg48（海外直连、无需签名，翻几十页也不会把代理打挂），失败回退官方。
       const raw = [];
+      const seenId = new Set();
       let next = newestLiveId;
+      let emptyRetry = false;   // 空页只重试一次（防偶发空页把历史拦腰截断）
+      let pages = 0;
       for (let pg = 0; pg < VOD_PAGES; pg++) {
-        const r = await fetchLiveListPage({ userId: uid, next, record: true });
+        let r;
+        try {
+          r = await fetchLiveListPageMsg48({ userId: uid, next, record: true });
+        } catch (e) {
+          try {
+            r = await fetchLiveListPage({ userId: uid, next, record: true });
+          } catch (e2) {
+            break;   // 两条通道都不通：已翻到的照常上报，剩下的下轮补
+          }
+        }
         const cur = r.list || [];
-        if (!cur.length) break;
+        let added = 0;
         for (const it of cur) {
-          if (raw.some((x) => String(x.liveId) === String(it.liveId))) continue;
+          const k = String(it.liveId);
+          if (seenId.has(k)) continue;
+          seenId.add(k);
           raw.push(it);
+          added++;
+        }
+        pages++;
+        if (!cur.length) {
+          // 空页：拿已翻到的最后一条 liveId 再探一次，仍空才认定到底
+          if (emptyRetry || !raw.length) break;
+          const last = String(raw[raw.length - 1].liveId || '');
+          if (!last || last === String(next)) break;
+          emptyRetry = true;
+          next = last;
+          continue;
         }
         const nx = String(r.next || '');
         const lastId = String(cur[cur.length - 1].liveId || '');
-        if (!nx || nx === '0' || nx === String(next) || (!cur.length)) break;
+        // 到底的三种信号：没游标 / 游标没变 / 整页都是重复的（接口在原地打转）
+        if (!nx || nx === '0' || nx === String(next) || added === 0) break;
         next = nx !== '0' ? nx : lastId;
         if (raw.length >= VOD_KEEP) break;
       }
@@ -193,6 +224,12 @@ async function worker() {
         playN += rows.filter((x) => x.play).length;
         listN += rows.length;
         batch.push({ uid, list: rows });
+        // 验收「翻到历史尽头」：记下全批最老的一场（ctime 最小值）
+        const tail = rows[rows.length - 1];
+        if (tail && tail.ctime && (!oldestTs || tail.ctime < oldestTs)) {
+          oldestTs = tail.ctime;
+          oldestUid = uid;
+        }
         has++;
       }
     } catch (e) {
@@ -206,4 +243,4 @@ async function worker() {
 
 await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, worker));
 await flush(true);
-log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 取址来源 msg48 ${viaMsg48} / 官方 ${viaPocket} · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);
+log(`完成：${uids.length} 人中 ${has} 人有录播 · ${listN} 场中 ${playN} 场可播（${((playN / Math.max(listN, 1)) * 100).toFixed(0)}%）· 取址来源 msg48 ${viaMsg48} / 官方 ${viaPocket} · 人均 ${(listN / Math.max(has, 1)).toFixed(0)} 场 · 最老 ${oldestTs ? dstr(oldestTs) + '（uid ' + oldestUid + '）' : '无'} · 耗时 ${((Date.now() - t0) / 1000 / 60).toFixed(1)} 分钟`);

@@ -22,7 +22,7 @@
  *   ONLY_FOLLOWED=1  只抓关注的人（本地调试用）
  *   DRY=1            只打印不提交（本地调试用）
  */
-import { fetchMessagePage, fetchLiveListPage, fetchLiveOne, fetchLiveOneMsg48, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
+import { fetchMessagePage, fetchLiveListPage, fetchLiveListPageMsg48, fetchLiveOne, fetchLiveOneMsg48, fetchNewestLiveId, pickPlayable } from './lib/api.mjs';
 import { pocketToView, isOwnerMsg } from './lib/view.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
@@ -179,8 +179,14 @@ let newestLiveId = '0';
 
 async function vodFor(uid) {
   try {
-    const r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
-    const list = (r.list || []).slice(0, VOD_KEEP);
+      // 翻页也走 msg48 主通道（海外直连），失败回退官方（官方要走国内代理，容易抖）
+      let r;
+      try {
+        r = await fetchLiveListPageMsg48({ userId: uid, next: newestLiveId, record: true });
+      } catch (e) {
+        r = await fetchLiveListPage({ userId: uid, next: newestLiveId, record: true });
+      }
+      const list = (r.list || []).slice(0, VOD_KEEP);
     if (!list.length) return null;
     // 库里已有的播放地址不必再取一遍：先读一次该成员现有回放，建 liveId → play 索引
     const have = new Map();

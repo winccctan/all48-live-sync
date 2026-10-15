@@ -38,7 +38,8 @@ jobs:
   vod:
     runs-on: ubuntu-latest
     # 全量取址（每人最多 60 场逐条 getLiveOne）实测约 25-40 分钟，留足余量
-    timeout-minutes: 150
+    # 全量历史（每人翻到尽头，单人可达 900+ 场）比翻 3 页慢很多，时限放宽
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v4
