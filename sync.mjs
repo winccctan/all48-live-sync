@@ -159,8 +159,10 @@ try {
 /* ---------- ②b 直播「先」落库（关键：别排到最后） ----------
    在播列表只有几十 KB，单独 POST 秒级完成，访客立刻能看到「谁在播」；
    后面的发言/录播哪怕整段崩了，在播状态也已经写进热窗了。
-   热窗是合并写入（{live, msgs:{}} 只改 live，不动已有发言）。 */
-if (!DRY && liveOk && live.length) {
+   热窗是合并写入（{live, msgs:{}} 只改 live，不动已有发言）。
+   🔴 抓成功但列表为空也要上报（liveOk 为真）：那就是「真的没人在播」，
+      早一点把热窗清空比让页面多挂几分钟下播的人更准。抓取抛错（liveOk 假）则绝不上报，别清空。 */
+if (!DRY && liveOk) {
   try {
     const out = await postIngest({ live, msgs: {} }, 60000);
     log('直播热窗已更新 ' + JSON.stringify(out));
