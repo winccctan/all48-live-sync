@@ -40,13 +40,39 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
 if (!DRY && !INGEST) { console.error('缺少 INGEST_TOKEN'); process.exit(1); }
 
-async function site(path, init) {
-  const res = await fetch(SITE + path, {
-    ...init,
-    headers: { 'User-Agent': UA, Accept: 'application/json', ...(init && init.headers) },
-  });
-  if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
-  return res;
+// 所有打到站点的请求都带超时 + 重试。
+// 🔴 2026-10-21 事故：`/api/ingest` 一次性塞 500 人发言，Worker 逐人 merge gap 写 R2 太慢，
+//    undici 默认 headersTimeout（5 分钟）直接把整个进程打崩 —— 在播列表早就抓到了，
+//    却因为排在最后一起上报，整轮白跑。⇒ 请求必须有超时，上报必须拆小。
+async function site(path, init, { timeout = 90000, retries = 2 } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetch(SITE + path, {
+        ...init,
+        signal: AbortSignal.timeout(timeout),
+        headers: { 'User-Agent': UA, Accept: 'application/json', ...(init && init.headers) },
+      });
+      if (!res.ok) throw new Error(`${path} → HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (i === retries) throw e;
+      log(`  ${path} 失败（${String(e.message).slice(0, 70)}），${i + 1}/${retries} 重试…`);
+      await sleep(1500 * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
+/** 上报一批（live 只在第一批带；带超时/重试，单批失败不影响其他批） */
+async function postIngest(body, timeout = 120000) {
+  const res = await site('/api/ingest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+    body: JSON.stringify(body),
+  }, { timeout, retries: 2 });
+  return res.json();
 }
 
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
@@ -126,6 +152,19 @@ try {
     ' · 首场流字段 ' + JSON.stringify(streamSample));
 } catch (e) {
   log('拉直播列表失败：' + e.message);
+}
+
+/* ---------- ②b 直播「先」落库（关键：别排到最后） ----------
+   在播列表只有几十 KB，单独 POST 秒级完成，访客立刻能看到「谁在播」；
+   后面的发言/录播哪怕整段崩了，在播状态也已经写进热窗了。
+   热窗是合并写入（{live, msgs:{}} 只改 live，不动已有发言）。 */
+if (!DRY && live.length) {
+  try {
+    const out = await postIngest({ live, msgs: {} }, 60000);
+    log('直播热窗已更新 ' + JSON.stringify(out));
+  } catch (e) {
+    log('直播热窗上报失败：' + String(e.message).slice(0, 120));
+  }
 }
 
 /* ---------- ③ 全员最新发言（并发池，关注的人在最前先抓） ---------- */
@@ -266,12 +305,14 @@ try {
   log('录播抓取失败：' + e.message);
 }
 
-/* ---------- ④ 上报 ---------- */
-const payload = { live, msgs };
-const size = JSON.stringify(payload).length;
+/* ---------- ④ 上报：分批 ----------
+   旧版一次性 POST {live, msgs(500 人)}：Worker 要逐人 merge gap 写 R2，
+   实测 5 分钟不回响应头 ⇒ undici HeadersTimeoutError ⇒ 进程直接崩，整轮白丢。
+   现在按 INGEST_BATCH（默认 60 人/批）拆开，每批独立超时，某批失败不影响其他批。 */
+const totalSize = JSON.stringify({ live, msgs }).length;
 
 if (DRY) {
-  console.log('\n[DRY] 不上报。体积 ' + (size / 1024).toFixed(1) + ' KB');
+  console.log('\n[DRY] 不上报。体积 ' + (totalSize / 1024).toFixed(1) + ' KB');
   console.log('在播:', JSON.stringify(live.map((x) => ({ u: x.userId, n: x.nickname, t: x.title, play: !!x.playStreamPath })), null, 1));
   const sample = Object.entries(msgs).find(([, v]) => v.length);
   if (sample) console.log('发言样例 [' + sample[0] + ']:', JSON.stringify(sample[1].slice(0, 3), null, 1));
@@ -279,24 +320,42 @@ if (DRY) {
   process.exit(0);
 }
 
-const res = await site('/api/ingest', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
-  body: JSON.stringify(payload),
-});
-const out = await res.json();
-log(`上报完成 ${JSON.stringify(out)} · 体积 ${(size / 1024).toFixed(1)}KB · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-
-/* ---------- ⑥ 录播单独上报（失败不影响发言那一份） ---------- */
+/* ---------- ④a 录播先上报（独立键，别被后面大批次拖死） ---------- */
 if (vods.length) {
   try {
     const r = await site('/api/vod/put', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
       body: JSON.stringify(vods),
-    });
+    }, { timeout: 120000, retries: 1 });
     log(`录播上报 ${JSON.stringify(await r.json())}`);
   } catch (e) {
     log('录播上报失败：' + e.message);
   }
 }
+
+/* ---------- ④b 发言分批上报 ---------- */
+const withMsgs = Object.keys(msgs).filter((u) => Array.isArray(msgs[u]) && msgs[u].length);
+const BATCH = Math.max(10, Number(process.env.INGEST_BATCH || 60));
+const batches = [];
+for (let i = 0; i < withMsgs.length; i += BATCH) batches.push(withMsgs.slice(i, i + BATCH));
+
+let sentOk = 0, sentFail = 0;
+for (let i = 0; i < batches.length; i++) {
+  const part = {};
+  for (const uid of batches[i]) part[uid] = msgs[uid];
+  const body = { msgs: part };
+  if (i === 0) body.live = live;   // 第一批再带一次在播，确保热窗里是最新的
+  try {
+    const out = await postIngest(body);
+    sentOk += batches[i].length;
+    log(`上报 ${i + 1}/${batches.length} 批（${batches[i].length} 人）→ ${JSON.stringify(out)}`);
+  } catch (e) {
+    sentFail += batches[i].length;
+    log(`上报第 ${i + 1} 批失败（${batches[i].length} 人）：` + String(e.message).slice(0, 110));
+  }
+}
+log(`上报完成：成功 ${sentOk} 人 / 失败 ${sentFail} 人 · 体积 ${(totalSize / 1024).toFixed(1)}KB · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+
+// 全批失败才让 workflow 变红（部分失败只留日志，避免刷红告警）
+if (!batches.length || (sentFail && !sentOk)) process.exitCode = 1;
