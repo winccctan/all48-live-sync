@@ -1,0 +1,45 @@
+# 2026 星梦剧院·年度之星 MVP 榜 —— 抓取与上报
+#
+# 数据源是口袋48 官方接口（MVP 活动页 mvp.ckg48.com 自己用的那两个）：
+#   POST /scan/api/scan/v2/get/condition  → 18 队 / 255 人
+#   POST /scan/api/scan/v1/query/mvp      → 逐人明细（必须逐人查，只传 teamId 会 500）
+#
+# 频率：每周三北京时间 12:01（UTC 04:01）。
+#   · GitHub 自己的 schedule 在这个仓库上历史上不激活（实测 4 小时 0 次），
+#     所以真正触发靠 Worker 的 Cron Trigger（1 4 * * 3）去调 workflow_dispatch；
+#     这里的 schedule 保留作二层保障，不冲突（脚本自身幂等，重复跑只是覆盖同一份数据）。
+name: MVP 榜
+
+on:
+  schedule:
+    - cron: '1 4 * * 3'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mvp-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 抓取并上报
+        run: node mvp-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          YEAR: '2026'
+          MVP_CONCURRENCY: '8'
