@@ -118,6 +118,7 @@ log(`本轮抓取 ${uids.length} 人` + (ONLY_FOLLOWED ? '（仅关注）' : '�
 /* ---------- ② 全站正在直播 ---------- */
 const live = [];
 let streamSample = null;   // 第一场直播的流字段快照，用来排查「到底有没有 HLS」
+let liveOk = false;        // 🔴 只有真的拉成功了才允许上报 live：抓取失败时绝不能拿空数组覆盖热窗
 try {
   // record=false ⇒ 返回「直播中」；实测 groupId 会被忽略，一次拿到全站在播
   const r = await fetchLiveListPage({ groupId: 1, next: '0', record: false });
@@ -148,6 +149,7 @@ try {
     });
   }
   log(`在播 ${live.length} 场：` + live.map((x) => `${x.nickname}(${x.liveId})`).join(' / '));
+  liveOk = true;
   log('可播流 ' + live.filter((x) => /^https?:/i.test(x.playStreamPath)).length + '/' + live.length +
     ' · 首场流字段 ' + JSON.stringify(streamSample));
 } catch (e) {
@@ -158,7 +160,7 @@ try {
    在播列表只有几十 KB，单独 POST 秒级完成，访客立刻能看到「谁在播」；
    后面的发言/录播哪怕整段崩了，在播状态也已经写进热窗了。
    热窗是合并写入（{live, msgs:{}} 只改 live，不动已有发言）。 */
-if (!DRY && live.length) {
+if (!DRY && liveOk && live.length) {
   try {
     const out = await postIngest({ live, msgs: {} }, 60000);
     log('直播热窗已更新 ' + JSON.stringify(out));
@@ -345,7 +347,7 @@ for (let i = 0; i < batches.length; i++) {
   const part = {};
   for (const uid of batches[i]) part[uid] = msgs[uid];
   const body = { msgs: part };
-  if (i === 0) body.live = live;   // 第一批再带一次在播，确保热窗里是最新的
+  if (i === 0 && liveOk) body.live = live;   // 第一批再带一次在播，确保热窗里是最新的（抓取失败就不带，别清空）
   try {
     const out = await postIngest(body);
     sentOk += batches[i].length;
