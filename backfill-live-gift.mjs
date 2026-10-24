@@ -23,6 +23,7 @@
  *   SINCE=2026-10-24T00:00:00+08:00 node ...     # 自定义起点
  *   FORCE=1 node ...                             # 忽略已扫标记，全量重扫
  *   LIMIT=50 CONC=6 node ...                     # 限量 / 并发
+ *   MAX_PAGES=3 CONC=6 node ...                  # 只翻当天那几页（高频快扫用）
  *   node backfill-live-gift.mjs --selftest       # 离线校验 LRC 解析（无需任何网络）
  *
  * 环境变量：
@@ -43,6 +44,8 @@ const SELFTEST = process.argv.includes('--selftest');
 const FORCE = !!process.env.FORCE;
 const LIMIT = Math.max(0, Number(process.env.LIMIT || 0));
 const CONC = Math.max(1, Number(process.env.CONC || 6));
+// 列表最多翻几页（高频快扫用：只要当天那几页，别每次都翻 40 页）
+const MAX_PAGES = Math.max(1, Number(process.env.MAX_PAGES || 40));
 
 // 活动起点（北京）：默认 2026-10-24 00:00 +08
 const BJ = 8 * 3600 * 1000;
@@ -165,7 +168,7 @@ const fetchLrc = (url) => fetchText(url, { timeout: 40000 });
 async function collectSessions() {
   const all = [];
   let next = '0';
-  for (let p = 0; p < 40; p++) {
+  for (let p = 0; p < MAX_PAGES; p++) {
     const r = await postJson('/live/api/v1/live/getLiveList',
       { debug: true, next: String(next), record: true }, { token: TOKEN, retries: 3 });
     const c = (r && r.content) || {};
@@ -257,7 +260,7 @@ async function main() {
 
   const caught = [];       // 本批成功处理的场次
   const liveLives = {};    // liveId → ctime，用于标记已扫
-  let grandHits = 0, grandSkip = 0, grandNoLrc = 0, grandErr = 0;
+  let grandHits = 0, grandSkip = 0, grandNoLrc = 0, grandErr = 0, grandEmpty = 0;
   const allItems = [];
 
   // 并发池
@@ -280,23 +283,27 @@ async function main() {
       let text = '';
       try { text = await fetchLrc(url); }
       catch (e) { grandErr++; if (grandErr <= 10) log(`  [${s.nick || s.liveId}] 下载回放失败：${String(e.message).slice(0, 70)}`); continue; }
-      const { items, hits, skipped } = parseLrc(text, s.ctime, NAME, memberUid);
+      const { items, hits, skipped, lines } = parseLrc(text, s.ctime, NAME, memberUid);
       grandHits += hits; grandSkip += skipped;
       if (hits) {
         allItems.push(...items);
         caught.push({ liveId: s.liveId, nick: s.nick, hits });
         log(`  ✅ [${s.nick || s.liveId}] ${hits} 个弦月回响（归户失败 ${skipped}）`);
       } else {
-        log(`  ·  [${s.nick || s.liveId}] 回放无目标礼物（归户失败 ${skipped}）`);
+        log(`  ·  [${s.nick || s.liveId}] 回放无目标礼物（行数 ${lines} · 归户失败 ${skipped}）`);
       }
-      liveLives[s.liveId] = s.ctime;   // 无论有没有礼物都标记已扫，避免反复拉同一场
+      // 🔴 空回放（0 行）**不能标记已扫**：刚结束那几分钟 msgFilePath 可能已经给了，
+      //    但文件内容还是空的（CDN 那头还在写）。标了就等于永久跳过这一场 —— 分数永远补不回来。
+      //    不标记 ⇒ 下一轮再来一次，等文件写完就能拿到。真实 0 送礼的场次「行数」不会是 0。
+      if (lines === 0) { grandEmpty++; continue; }
+      liveLives[s.liveId] = s.ctime;   // 有内容就标记已扫（有没有目标礼物都算扫过）
     }
   }
   await Promise.all(Array.from({ length: Math.min(CONC, todo.length) }, worker));
 
   await ingest(allItems, liveLives);
 
-  log(`完成：处理 ${caught.length} 场有分 · 无回放 ${grandNoLrc} · 错误 ${grandErr}`);
+  log(`完成：处理 ${caught.length} 场有分 · 无回放 ${grandNoLrc} · 空回放(下轮重试) ${grandEmpty} · 错误 ${grandErr}`);
   log(`本批弦月回响 ${grandHits} 个（归户失败 ${grandSkip}） · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   if (caught.length) {
     log('有分的场次：' + caught.map((c) => `${c.nick || c.liveId}(${c.hits})`).slice(0, 20).join(' '));

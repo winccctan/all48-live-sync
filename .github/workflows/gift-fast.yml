@@ -53,3 +53,30 @@ jobs:
           MAX_MEMBERS: '600'
           CONC: ${{ inputs.conc }}
           GIFT_PAGES: ${{ inputs.pages }}
+
+  # 直播侧同频：房间礼物走轮询，直播礼物走「结束后的回放弹幕 .lrc」。
+  # 回放文件只在直播结束后才出现 ⇒ 想「近实时」只有一条路：**高频去看有没有刚结束的场次**。
+  # 这里跟房间快扫同一个 2 分钟节奏，一轮只翻 3 页、并发 6，实测 3~5 秒跑完（全是增量）。
+  # 🔴 已扫标记在 worker 的 gift:livecur 里，只在「回放文件有内容」时才写，
+  #    刚结束那几分钟文件还是空的 ⇒ 不标记，下一轮自动重试（否则那一整场分会永久丢掉）。
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 补抓直播回放弹幕里的弦月回响
+        run: node backfill-live-gift.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          MAX_PAGES: '3'
+          CONC: '6'
