@@ -1,0 +1,31 @@
+# 一次性探针：直播间礼物（弹幕 LRC）
+#
+# 只读，不上报。验证「弦月回响」是否出现在直播间弹幕播报里，
+# 以及 target 字段写法（决定成员归户），弹幕里是否有送礼人 uid。
+name: 探针 · 直播礼物
+
+on:
+  workflow_dispatch:
+    inputs:
+      lives:
+        description: '看最近多少场直播'
+        default: '12'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 探测
+        run: node probe-livegift.mjs
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          PLIVE_LIVES: ${{ inputs.lives }}
