@@ -64,7 +64,9 @@ case "${1:-}" in
     echo "--- 最近日志"
     tail -n 20 "$LOG" || true
     echo "--- healthz"
-    curl -s --max-time 5 "http://127.0.0.1:${NIM_PORT:-8788}/healthz" | head -20 || echo "（还没起来）"
+    # 端口以 env 文件里的为准（外层 shell 通常没有 NIM_PORT）
+    ENVPORT=$(sed -n 's/^NIM_PORT=\([0-9]*\)$/\1/p' "$ENV_FILE" | tail -1)
+    curl -s --max-time 5 "http://127.0.0.1:${ENVPORT:-8788}/healthz" | head -20 || echo "（还没起来）"
     exit 0
     ;;
   --awake)

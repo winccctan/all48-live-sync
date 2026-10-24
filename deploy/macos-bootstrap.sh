@@ -58,27 +58,41 @@ if [ -z "$NODE_BIN" ]; then
   echo "绿色版 node → $NODE_BIN"
 fi
 NODE_DIR=$(dirname "$NODE_BIN")
+
+# 🔴🔴 必须把 node 目录塞进 PATH：
+#    绿色解压版装的 npm 是 `#!/usr/bin/env node` 的脚本，
+#    PATH 里没有 node 时会直接报 `env: node: No such file or directory`（2026-10-24 真实踩到）。
+export PATH="$NODE_DIR:$PATH"
+
 NPM="$NODE_DIR/npm"
 [ -x "$NPM" ] || NPM="$(command -v npm 2>/dev/null || true)"
 [ -n "$NPM" ] && [ -x "$NPM" ] || die "找不到 npm（Node 装得不全）"
 
 # ---------- ② 代码 ----------
 say "拉代码到 $APP"
+TARBALL_URL="https://github.com/winccctan/all48-live-sync/archive/refs/heads/main.tar.gz"
+# 压缩包覆盖式更新：只覆盖代码文件，不会动 nim-sync.env / nim-sync.log（它们不在包里）
+fetch_tar() {
+  mkdir -p "$APP"
+  curl -fL --max-time 300 "$TARBALL_URL" | tar -xz -C "$APP" --strip-components=1 \
+    || die "代码下载失败（检查网络，或先装 git）"
+}
 # 🔴 新 Mac 上 /usr/bin/git 只是个占位，没装 Xcode 命令行工具时一调就弹窗卡住。
 #    所以先用 `git --version` 试一下，不行就走 tarball，全程不依赖 git。
 if git --version >/dev/null 2>&1; then
   if [ -d "$APP/.git" ]; then
     (cd "$APP" && git pull -q --ff-only) || echo "（git pull 失败，继续用现有代码）"
   else
-    mkdir -p "$(dirname "$APP")"
-    git clone -q --depth 1 "$REPO" "$APP"
+    # 🔴 目录已存在（上一次用压缩包装的 / 残留）时 git clone 会报「目录非空」，
+    #    这里改成失败就退回压缩包覆盖，重跑不会再中断。
+    if ! git clone -q --depth 1 "$REPO" "$APP" 2>/dev/null; then
+      echo "（clone 不成功，改用压缩包覆盖代码）"
+      fetch_tar
+    fi
   fi
 else
   echo "没有可用的 git，改用压缩包下载"
-  mkdir -p "$APP"
-  curl -fL --max-time 300 "https://github.com/winccctan/all48-live-sync/archive/refs/heads/main.tar.gz" \
-    | tar -xz -C "$APP" --strip-components=1 \
-    || die "代码下载失败（检查网络，或先装 git）"
+  fetch_tar
 fi
 cd "$APP"
 
