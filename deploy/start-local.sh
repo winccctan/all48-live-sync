@@ -18,14 +18,22 @@ ENV_FILE=${ENV_FILE:-$APP/nim-sync.env}
 LOG=${NIM_LOG:-$APP/nim-sync.log}
 PIDFILE=$APP/nim-sync.pid
 
-# 选 Node：优先 PATH 里的，其次 WorkBuddy 托管版
+# 选 Node：NODE_BIN（env 里写死的绝对路径）> PATH > 常见安装位置 > 绿色解压目录
+# 之所以要这么宽：launchd 拉起的进程几乎没有 PATH，必须能靠绝对路径找到 node
 pick_node() {
-  for c in "$(command -v node 2>/dev/null || true)" \
+  local c
+  for c in "${NODE_BIN:-}" \
+           "$(command -v node 2>/dev/null || true)" \
            /usr/local/bin/node \
            /opt/homebrew/bin/node \
+           "$HOME/.local/bin/node" \
            "$HOME/.workbuddy/binaries/node/versions/22.22.2-6/bin/node"; do
     [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return; }
   done
+  # 绿色解压版：~/.local/node-vXX.X.X-darwin-arm64/bin/node（有多个取最后一个）
+  local last=""
+  for c in "$HOME"/.local/node-v*/bin/node; do [ -x "$c" ] && last="$c"; done
+  [ -n "$last" ] && { echo "$last"; return; }
   return 1
 }
 
