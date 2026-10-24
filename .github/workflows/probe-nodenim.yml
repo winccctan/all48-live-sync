@@ -52,13 +52,20 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq proxychains4
+          # 🔴 proxychains 4.17 在 strict_chain + 首个代理 + proxy_dns 时仍拒绝域名，
+          #    必须先把主机名解析成 IP 再写进配置。
           node -e '
+            const dns = require("node:dns");
             const u = new URL(process.env.PX.split(",")[0].trim());
-            const user = decodeURIComponent(u.username || "");
-            const pass = decodeURIComponent(u.password || "");
-            const lines = ["strict_chain", "proxy_dns", "tcp_read_time_out 20000", "tcp_connect_time_out 10000", "[ProxyList]"];
-            lines.push(`http ${u.hostname} ${u.port} ${user} ${pass}`);
-            process.stdout.write(lines.join("\n") + "\n");
+            dns.lookup(u.hostname, (err, ip) => {
+              if (err) { console.error("解析失败:", err.message); process.exit(1); }
+              const user = decodeURIComponent(u.username || "");
+              const pass = decodeURIComponent(u.password || "");
+              const lines = ["strict_chain", "proxy_dns", "tcp_read_time_out 20000", "tcp_connect_time_out 10000", "[ProxyList]"];
+              lines.push(`http ${ip} ${u.port} ${user} ${pass}`);
+              process.stdout.write(lines.join("\n") + "\n");
+              console.error(`代理主机解析为 ${ip}`);
+            });
           ' > /tmp/proxychains4.conf
           sudo cp /tmp/proxychains4.conf /etc/proxychains4.conf
           echo "proxychains 已配置（不打印内容）"
