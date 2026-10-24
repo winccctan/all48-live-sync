@@ -5,3 +5,6 @@ node_modules/
 nim-state/
 nim-sync.env
 nim-sync.pid
+
+# xox48 对账补差的本地缓存（每成员上次拉到的 live_vote）
+.xox-cache.json

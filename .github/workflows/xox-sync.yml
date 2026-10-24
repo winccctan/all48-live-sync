@@ -1,0 +1,65 @@
+# 红蓝歌会 · 直播侧对账补差（数据源 xox48.top）
+#
+# 为什么需要这条通道（2026-10-25 站长反馈「覃柯蒙怎么没抓到」「很多结束的直播都没抓到」）：
+#   我们自己抓直播礼物有三条路，各自都有硬伤——
+#     · 48fan SSE（live-sse-sync.mjs）：单出口 IP 只撑得住 ~6 条并发流，且接力链一断整段空白；
+#     · 回放 .lrc（live-fast.yml）：只有**直播结束后**才有文件，正在播的场次永远是 0；
+#     · 口袋48 云信 NIM：应用级 403，彻底不通。
+#   而 xox48.top 的 /Hl/rank + /Hl/detail 是现成可用的：**直播进行中就在更新**，
+#   口径也验证过自洽（覃柯蒙 直播间 38 条 = 673 分，与它自己报的 live_vote 一分不差）。
+#
+# 所以这条通道只做「对账补差」：拿 xox48 的全员直播明细，跟站里已有的记录一对一比对，
+# **只把我们确实没有的补进去**（规则见 lib/reconcile.mjs）。不重复计分，
+# 也不会跟我们自己的 SSE / LRC 数据打架。
+#
+# 🔴 省请求：脚本内置两道闸（分数已追平就不拉明细 / 10 分钟内拉过且分数没变就跳过），
+#    静默期整轮只有 2 个请求；xox48 是个小站，打猛了会掐连接。
+#
+# 由站点 Worker 的 cron（*/2）拨号，与 gift-fast.yml 同频。
+name: 红蓝歌会 · 直播对账
+
+on:
+  workflow_dispatch:
+    inputs:
+      member:
+        description: '只处理某个成员（留空 = 全员）'
+        default: ''
+      since:
+        description: '起算时间（北京，留空 = 今天 0 点退 6 小时）'
+        default: ''
+      full:
+        description: '1 = 忽略缓存全量重拉'
+        default: ''
+
+permissions:
+  contents: read
+
+# 同一时间只跑一轮：xox48 承受不了并发打，Worker 侧也会查在跑就跳过
+concurrency:
+  group: xox-sync
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 对账并补差
+        run: node xox-live-backfill.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          MEMBER: ${{ inputs.member }}
+          SINCE: ${{ inputs.since }}
+          FULL: ${{ inputs.full }}
+          # xox48 并发打高了会掐连接（undici 报 other side closed），2 是实测稳的上限
+          CONC: '2'
+          TOL: '20'

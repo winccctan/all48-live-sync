@@ -31,6 +31,7 @@
  */
 import { postJson, fetchText } from './lib/api.mjs';
 import { createGiftParser } from './lib/nim-parse.mjs';
+import { reconcileRows, indexByMid } from './lib/reconcile.mjs';
 
 /* -------------------------------------------------------------- 参数 */
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
@@ -217,6 +218,33 @@ async function collectSessions() {
   return uniq;
 }
 
+/* ----------------------------------------------- 站点读：已有直播记录 */
+// 🔴 为什么必须有（2026-10-25）：直播侧现在有三条来源 —— 48fan SSE、本脚本的回放 LRC、
+//    以及 xox-live-backfill.mjs 的对账补差。三者时间戳口径不同（serverTime / ctime+偏移 /
+//    xox 自己的入库时间），worker 的精确去重键 `t|sid|mid|gid|num|src` 对不上
+//    ⇒ 同一条礼物会被算两次，分数虚高。
+//    所以扫完一场先跟「站里已经有的」对一遍，只补配不上的（规则见 lib/reconcile.mjs）。
+const MATCH_TOL = Math.max(1, Number(process.env.TOL || 20)) * 60000;
+const bjDayOf = (ms) => new Date(Number(ms) + BJ).toISOString().slice(0, 10).replace(/-/g, '');
+
+async function loadLiveIndex() {
+  if (!SITE || !INGEST) return new Map();
+  try {
+    const u = `${SITE}/api/gift/liveall?from=${bjDayOf(SINCE)}&to=${bjDayOf(Date.now())}`;
+    const r = await fetch(u, {
+      headers: { 'x-ingest-token': INGEST, Accept: 'application/json', 'User-Agent': 'all48-backfill-live/1.0' },
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const idx = indexByMid(j.rows || []);
+    log(`站内已有直播记录 ${(j.rows || []).length} 条 · ${idx.size} 位成员（对账基准）`);
+    return idx;
+  } catch (e) {
+    log('读站内直播记录失败（本轮不做对账，可能重复计分）：' + String(e.message).slice(0, 90));
+    return new Map();
+  }
+}
+
 /* ----------------------------------------------------------- 上报 */
 async function ingest(items, lives) {
   if (DRY) {
@@ -293,6 +321,8 @@ async function main() {
   const liveLives = {};    // liveId → ctime，用于标记已扫
   let grandHits = 0, grandSkip = 0, grandNoLrc = 0, grandErr = 0, grandEmpty = 0;
   const allItems = [];
+  // 站里已有的直播记录（对账基准）：本轮新补的也会实时加进来，保证批内不重复
+  const liveIndex = await loadLiveIndex();
 
   // 并发池
   let idx = 0;
@@ -317,9 +347,30 @@ async function main() {
       const { items, hits, skipped, lines } = parseLrc(text, s.ctime, NAME, memberUid);
       grandHits += hits; grandSkip += skipped;
       if (hits) {
-        allItems.push(...items);
+        // 🔴 先跟站里已有的对账，再把真正缺的加进来。
+        //    xox-live-backfill 补过的场次、以及 SSE 实时收过的场次，在这里都会被吃掉，
+        //    不会因为「时间戳口径不同」被算第二遍。按 mid 分组，逐成员一对一匹配。
+        const byMid = new Map();
+        for (const it of items) {
+          const a = byMid.get(it.mid);
+          if (a) a.push(it); else byMid.set(it.mid, [it]);
+        }
+        let fresh = 0;
+        for (const [mid, group] of byMid) {
+          const mine = liveIndex.get(mid) || [];
+          const miss = reconcileRows(mine, group, MATCH_TOL);
+          if (!miss.length) continue;
+          // 对账按 {t,sn,num} 匹配，但写回站里要保留 LRC 侧的完整字段（mid/g/gid/src）
+          const keep = group.filter((it) => miss.some((m) => m.t === it.t && m.num === it.num && m.sn === it.sn));
+          allItems.push(...keep);
+          fresh += keep.reduce((a, b) => a + b.num, 0);
+          // 把新加的同步进索引：同一批里后面再遇到同样的礼物就不会重复补
+          const arr = liveIndex.get(mid) || [];
+          for (const it of keep) arr.push({ t: it.t, sn: it.sn, num: it.num });
+          liveIndex.set(mid, arr);
+        }
         caught.push({ liveId: s.liveId, nick: s.nick, hits });
-        log(`  ✅ [${s.nick || s.liveId}] ${hits} 个弦月回响（归户失败 ${skipped}）`);
+        log(`  ✅ [${s.nick || s.liveId}] ${hits} 个弦月回响（新增 ${fresh} · 已有 ${hits - fresh} · 归户失败 ${skipped}）`);
       } else {
         log(`  ·  [${s.nick || s.liveId}] 回放无目标礼物（行数 ${lines} · 归户失败 ${skipped}）`);
       }
