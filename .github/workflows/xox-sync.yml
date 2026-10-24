@@ -30,6 +30,9 @@ on:
       full:
         description: '1 = 忽略缓存全量重拉'
         default: ''
+      src:
+        description: '1=只补直播 0=只补房间 all=两路（默认）'
+        default: 'all'
 
 permissions:
   contents: read
@@ -42,7 +45,8 @@ concurrency:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 两路（直播 + 房间）串行跑，房间缺口大的首轮会久一些；xox48 限流又不能开并发
+    timeout-minutes: 18
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,6 +64,7 @@ jobs:
           MEMBER: ${{ inputs.member }}
           SINCE: ${{ inputs.since }}
           FULL: ${{ inputs.full }}
+          SRC: ${{ inputs.src || 'all' }}
           # xox48 并发打高了会掐连接（undici 报 other side closed），2 是实测稳的上限
           CONC: '2'
           TOL: '20'
