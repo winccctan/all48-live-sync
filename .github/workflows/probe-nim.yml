@@ -1,0 +1,33 @@
+# 一次性探针：直播间实时消息（NIM Chatroom 长连接）
+#
+# 验证「弦月回响」在直播间是实时可见的（不用等直播结束）。
+# 只读，不上报。
+name: 探针 · 直播实时消息
+
+on:
+  workflow_dispatch:
+    inputs:
+      listen:
+        description: '监听多少秒'
+        default: '90'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 装 NIM SDK
+        run: npm i @yxim/nim-web-sdk xhr2 --no-audit --no-fund --cache /tmp/npmcache
+      - name: 监听直播间
+        run: node probe-nim-gift.mjs
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          NIM_LISTEN: ${{ inputs.listen }}
