@@ -1,0 +1,55 @@
+# 红蓝歌会 · 礼物快扫（近实时通道）
+#
+# 为什么单独开一个工作流：
+#   房间礼物只能靠轮询 /im/api/v1/team/message/list/all 拿（口袋48 的房间 IM 没有长连接给外部用），
+#   所以「实时」= 把轮询做密。原来它挂在 sync.yml 里跟着 15 分钟一轮 + 12 分钟节流，
+#   最坏要等 20 分钟才更新一次。这里拆出来由站点 Worker 的 cron 每 2 分钟拨一次，
+#   只翻 1~2 页、并发拉高，一轮 ~2 分钟就能扫完全部 471 个房间。
+#
+# 🔴 仓库是 public ⇒ Actions 分钟数免费，高频跑不吃额度。
+# 🔴 深度翻页（3 页）留给 sync.yml 里那条低频通道做兜底，两条通道共用同一份游标与去重，不会重复计分。
+name: 红蓝歌会 · 礼物快扫
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: '每个房间最多翻几页（一页 50 条）'
+        default: '2'
+      conc:
+        description: '并发数'
+        default: '14'
+
+permissions:
+  contents: read
+
+# 同一时间只允许一轮：站点 cron 每 2 分钟拨一次，上一轮没跑完就跳过（Worker 侧也会查）。
+# 不排队（cancel-in-progress: false 且 Worker 会跳过在跑的），避免堆积把 runner 占满。
+concurrency:
+  group: gift-fast
+  cancel-in-progress: false
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 快扫房间礼物并上报
+        run: node gift-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          GIFT_NAME: '弦月回响'
+          MAX_MEMBERS: '600'
+          CONC: ${{ inputs.conc }}
+          GIFT_PAGES: ${{ inputs.pages }}
