@@ -93,7 +93,10 @@ const APPKEY = process.env.NIM_APPKEY || '632feff1f4c838541ab75195d1ceb3fa';
 //    唯一真实限制是「同一 accid 多连接会不会被云信互踢」——靠 healthz 的
 //    unstable 字段观测：一直涨就说明要拆成多账号（见 deploy/README.md）。
 const ROOMS_MAX_CFG = Number(process.env.NIM_ROOMS_MAX ?? 6);
-const ROOMS_HARD = 60;   // 硬上限，防止误配成天文数字把进程拖死
+// 🔴 实测数据（2026-10-24，拉 500 场历史直播做扫描线）：晚间 20~00 点是开播高峰，
+//    按 1 小时时长估峰值约 39 场同时在播，按 2 小时估约 55 场 ⇒ 硬上限留足余量到 120。
+//    但真正卡住的不是这个数字，是「一个 accid 能挂几条 WS 才被云信踢」。
+const ROOMS_HARD = 120;  // 硬上限，防止误配成天文数字把进程拖死
 const ROOMS_MAX = ROOMS_MAX_CFG <= 0 ? ROOMS_HARD : Math.min(ROOMS_HARD, ROOMS_MAX_CFG);
 const ROOMS_ALL = ROOMS_MAX_CFG <= 0;
 const PORT = Number(process.env.NIM_PORT === undefined ? 8788 : process.env.NIM_PORT);
