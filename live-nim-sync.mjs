@@ -88,7 +88,7 @@ const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const APPKEY = process.env.NIM_APPKEY || '632feff1f4c838541ab75195d1ceb3fa';
 // 🔴 NIM_ROOMS_MAX = 同时监听的**直播间场次数**（一个 liveId 一条 WS），不是成员数。
-//    0（或负数）= 全部在播场次都听，不砍（另受 ROOMS_HARD=60 硬上限兜底）。
+//    0（或负数）= 全部在播场次都听，不砍（另受 ROOMS_HARD=120 硬上限兜底）。
 //    2026-10-24 站长拍板：6 不够，全团随时可能十几场同时开，漏一场就漏分。
 //    唯一真实限制是「同一 accid 多连接会不会被云信互踢」——靠 healthz 的
 //    unstable 字段观测：一直涨就说明要拆成多账号（见 deploy/README.md）。
