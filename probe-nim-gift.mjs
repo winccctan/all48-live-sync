@@ -30,6 +30,8 @@ try {
   const xhr2 = require('xhr2');
   if (typeof globalThis.XMLHttpRequest === 'undefined') globalThis.XMLHttpRequest = xhr2;
 } catch { /* noop */ }
+// 🔴 Chatroom SDK 会摸 window，Node 里必须补
+try { if (!globalThis.window) globalThis.window = globalThis; } catch { /* noop */ }
 
 const APPKEY = process.env.NIM_APPKEY || '632feff1f4c838541ab75195d1ceb3fa';
 const TOKEN = process.env.POCKET48_TOKEN || '';
@@ -86,12 +88,13 @@ if (!rooms.length) { console.error('没有可进的直播间'); process.exit(0);
 /* ④ 进聊天室监听 */
 let NIMSDK;
 try {
-  NIMSDK = require('@yxim/nim-web-sdk/dist/SDK/NIM_Web_SDK_nodejs.js');
+  // 🔴 必须是 **Chatroom 专用** SDK：完整版 NIM_Web_SDK 需要先 login 才能进聊天室，
+  //    直接 getInstance 不会建连（实测 90s 收 0 条、连 onconnect 都不触发）。
+  NIMSDK = require('@yxim/nim-web-sdk/dist/SDK/NIM_Web_Chatroom_nodejs.js');
 } catch (e) {
-  console.error('加载 NIM SDK 失败：' + String(e.message).slice(0, 200));
+  console.error('加载 NIM Chatroom SDK 失败：' + String(e.message).slice(0, 200));
   process.exit(1);
 }
-if (!NIMSDK.Chatroom) { console.error('SDK 未导出 Chatroom'); process.exit(1); }
 
 // 先只进第一个房间（人最多的那间），避免多连接互相干扰
 rooms.sort((a, b) => b.online - a.online);
@@ -103,7 +106,7 @@ const giftMsgs = [];
 const rawSamples = [];
 let total = 0;
 
-const chatroom = NIMSDK.Chatroom.getInstance({
+const chatroom = NIMSDK.getInstance({
   appKey: APPKEY,
   account: accid,
   token: pwd,
@@ -113,6 +116,7 @@ const chatroom = NIMSDK.Chatroom.getInstance({
   onconnect() { log('✅ NIM 已连上聊天室'); },
   onerror(e) { log('⚠️ NIM 错误：' + ((e && (e.message || e.code)) || e)); },
   onwillreconnect() { log('↻ 重连中…'); },
+  ondisconnect(e) { log('⚠️ 断开：' + ((e && (e.message || e.code)) || e)); },
 });
 
 /** 消息处理：把类型、文本、自定义体都摊开看 */
