@@ -1,0 +1,34 @@
+# 一次性探针：看 SCRAPE_PROXY 各个代理的出口 IP 落在哪里
+#
+# 🔴 仓库是 public，日志公开可见 —— **绝对不要打印代理地址/账号密码**，
+#    这里只输出出口 IP，用来判断「是不是国内出口」。
+name: 探针 · 代理出口
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Runner 直连出口
+        run: |
+          echo "runner 直连 = $(curl -s --max-time 15 https://api.ipify.org || echo FAIL)"
+
+      - name: 各代理出口
+        env:
+          PX: ${{ secrets.SCRAPE_PROXY }}
+        run: |
+          if [ -z "$PX" ]; then echo "SCRAPE_PROXY 为空"; exit 0; fi
+          n=0
+          echo "$PX" | tr ',' '\n' | while read -r p; do
+            p=$(printf '%s' "$p" | tr -d '[:space:]')
+            [ -z "$p" ] && continue
+            n=$((n + 1))
+            ip=$(curl -s --max-time 25 -x "$p" https://api.ipify.org 2>/dev/null || echo FAIL)
+            echo "代理 #$n 出口 = $ip"
+          done
