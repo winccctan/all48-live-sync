@@ -4,8 +4,10 @@
 #   ./deploy/macos-install.sh          安装并立刻启动
 #   ./deploy/macos-install.sh --remove 卸载
 #
-# 🔴 说明：LaunchAgent 只能管「系统醒着」的时间。笔记本合盖会睡眠，连接会断；
-#    台式机或设置「防止自动睡眠」才适合长期挂着（见 deploy/README.md）。
+# 🔴 说明：LaunchAgent 只能管「系统醒着」的时间。
+#    这里用 caffeinate 包一层，服务在跑时**不让系统空闲睡眠**（-i）、接电源时也不睡（-s）。
+#    但**笔记本合盖**仍然会睡（macOS 的硬件行为，普通程序挡不住）⇒
+#    长期挂最好用台式机，或笔记本接着电源、不合盖、把「关闭显示器后防止自动睡眠」打开。
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -33,6 +35,9 @@ cat > "$PLIST" <<PLIST_EOF
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-s</string>
     <string>/bin/bash</string>
     <string>$APP/deploy/start-local.sh</string>
   </array>
