@@ -8,8 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       lives:
-        description: '看最近多少场直播'
-        default: '12'
+        description: '最多看几场'
+        default: '30'
+      hours:
+        description: '只看最近几小时内开的场（含在播）'
+        default: '8'
 
 permissions:
   contents: read
@@ -24,8 +27,9 @@ jobs:
         with:
           node-version: '22'
       - name: 探测
-        run: node probe-livegift.mjs
+        run: node probe-livegift2.mjs
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
-          PLIVE_LIVES: ${{ inputs.lives }}
+          PLIVE_MAX: ${{ inputs.lives }}
+          PLIVE_HOURS: ${{ inputs.hours }}
