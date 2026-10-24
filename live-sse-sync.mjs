@@ -64,7 +64,15 @@ const START_PER_MIN = Math.max(1, Number(process.env.START_PER_MIN || 12));
 //      每片控制在 6 个以内。GitHub Actions 的每个 job 是独立 runner（独立 IP），天然可以分摊。
 const SHARDS = Math.max(1, Number(process.env.SHARDS || 1));
 const SHARD = Math.min(SHARDS - 1, Math.max(0, Number(process.env.SHARD || 0)));
-const inShard = (liveId) => SHARDS === 1 || (Number(liveId) % SHARDS) === SHARD;
+// 🔴 别用 `Number(liveId) % SHARDS`：口袋48 的 liveId **末位永远是偶数**
+//    （1320895340900847616 / 1320889448901971968 …），%10 只会落在 0/2/4/6/8，
+//    10 片里有 5 片一个房间都分不到。必须走字符串哈希。
+function fnv1a(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+const inShard = (liveId) => SHARDS === 1 || (fnv1a(String(liveId)) % SHARDS) === SHARD;
 const PORT = Number(process.env.HEALTHZ_PORT || 8790);
 const STATE_FILE = process.env.SSE_STATE || '/tmp/live-sse-sync.state.json';
 
