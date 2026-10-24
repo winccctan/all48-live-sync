@@ -1,0 +1,58 @@
+# 红蓝歌会 · 直播回放快抓（1 分钟通道）
+#
+# 为什么要单独一条：
+#   直播送礼不走房间 IM，只能靠「直播结束后生成的回放弹幕 .lrc」。
+#   回放文件只在 status 变 3（已结束）之后才出现 ⇒ 「准实时」唯一的变量就是
+#   **多久去看一次有没有刚结束的场次**。
+#   原来它挂在 gift-fast.yml（2 分钟一轮、且和房间快扫两个 job 抢同一个 runner 配额），
+#   实测「关播 → 上分」要 2~4 分钟。这里拆成独立工作流、由站点 Worker cron 每 1 分钟拨一次，
+#   一轮只翻 1 页 + 只处理「未扫」场次，实测 3~8 秒跑完。
+#
+# 🔴 仓库是 public ⇒ Actions 分钟数免费，高频跑不吃额度。
+# 🔴 深度兜底仍在 sync.yml 的 livegift job（15 分钟一轮、翻到底、按 SINCE 全量核对）。
+# 🔴 已扫标记在 Worker 的 gift:livecur：**只有回放文件真的有内容才写**，
+#    刚结束那几十秒文件可能还是空的 ⇒ 不标记、下一轮自动重试（否则那一整场分会永久丢）。
+# 🔴 与 gift-fast 共用 worker 端去重键 t|sid|mid|gid|num|src，重复跑不会重复计分。
+name: 红蓝歌会 · 直播回放快抓
+
+on:
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: '翻几页已结束列表（1 页 ≈ 近 20 场，增量足够）'
+        default: '1'
+      conc:
+        description: '并发数'
+        default: '6'
+
+permissions:
+  contents: read
+
+# 同一时间只允许一轮：上一轮没跑完就丢新的（Worker 侧也会查 runs 状态再拨）
+concurrency:
+  group: live-fast
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 抓刚结束场次的回放弹幕（弦月回响）
+        run: node backfill-live-gift.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          GIFT_NAME: '弦月回响'
+          MAX_PAGES: ${{ inputs.pages }}
+          CONC: ${{ inputs.conc }}
