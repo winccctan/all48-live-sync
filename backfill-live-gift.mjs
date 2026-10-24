@@ -47,17 +47,24 @@ const CONC = Math.max(1, Number(process.env.CONC || 6));
 // 列表最多翻几页（高频快扫用：只要当天那几页，别每次都翻 40 页）
 const MAX_PAGES = Math.max(1, Number(process.env.MAX_PAGES || 40));
 
-// 活动起点（北京）：默认 2026-10-24 00:00 +08
+// 活动起点（北京）：默认「北京今天 0 点往前再退 6 小时」
+// 🔴 为什么不再写死 2026-10-24：这个脚本现在挂在 2 分钟快扫里天天跑，
+//    写死日期到第二天就再也扫不到新场次，而且从页面上只表现为「直播分不动」。
+// 🔴 为什么退 6 小时：23:50 开播、00:20 结束那种场次，ctime 落在「昨天」——
+//    只按今天 0 点起算会整场跳过；已扫标记（gift:livecur）保证退回去也不会重复计分。
 const BJ = 8 * 3600 * 1000;
+function todayBjStart() {
+  return Math.floor((Date.now() + BJ) / 86400000) * 86400000 - BJ;
+}
 function parseSince(s) {
-  if (!s) return Date.UTC(2026, 9, 24, 0, 0, 0) - BJ; // 2026-10-24 北京 0 点
+  if (!s) return todayBjStart() - 6 * 3600 * 1000;
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?(\+\d{2}:?\d{2})?$/.exec(s.trim());
   if (m) {
     const [, y, mo, d, hh = 0, mi = 0, ss = 0] = m;
     return Date.UTC(+y, +mo - 1, +d, +hh, +mi, +ss) - BJ;
   }
   const t = Date.parse(s);
-  return Number.isFinite(t) ? t : Date.UTC(2026, 9, 24) - BJ;
+  return Number.isFinite(t) ? t : todayBjStart() - 6 * 3600 * 1000;
 }
 const SINCE = parseSince(process.env.SINCE);
 
