@@ -47,12 +47,17 @@ node -v || die "node 装不上"
 
 # ---------- 2. 代码 ----------
 say "部署代码到 $APP_DIR"
-mkdir -p "$APP_DIR"
-cp -f live-nim-sync.mjs package.json "$APP_DIR"/
-rm -rf "$APP_DIR/lib"
-cp -r lib "$APP_DIR"/
-mkdir -p "$APP_DIR/deploy" "$STATE_DIR"
-cp -f deploy/all48-nim-sync.service "$APP_DIR/deploy/" 2>/dev/null || true
+mkdir -p "$APP_DIR" "$STATE_DIR"
+# 如果就是当前目录（git clone 到 /opt/all48-live-sync 的情况），别再往自己身上拷
+if [ "$(cd "$APP_DIR" && pwd -P)" != "$(pwd -P)" ]; then
+  cp -f live-nim-sync.mjs package.json "$APP_DIR"/
+  rm -rf "$APP_DIR/lib"
+  cp -r lib "$APP_DIR"/
+  mkdir -p "$APP_DIR/deploy"
+  cp -f deploy/all48-nim-sync.service "$APP_DIR/deploy/" 2>/dev/null || true
+else
+  echo "（就地安装：代码已经在 $APP_DIR）"
+fi
 
 say "安装依赖（registry=$NPM_REGISTRY）"
 cd "$APP_DIR"

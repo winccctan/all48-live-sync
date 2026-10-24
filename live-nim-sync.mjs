@@ -81,12 +81,15 @@ const DUMP = !!process.env.NIM_DUMP;
 const DRY = !!process.env.DRY;
 const STATE_DIR = process.env.NIM_STATE || path.resolve('nim-state');
 
+// 🔴 顺序按「国内出口」排（2026-10-24 实测）：大陆机器 link-ga-hz 最快，
+//    weblink01 稳；weblinkoutsea01 是海外节点，国内反而慢。
+//    逐个探活，用第一个能建 WS 的。
 const LINKS = String(process.env.NIM_LINKS || [
-  'weblinkoutsea01.netease.im:443',
-  'chatweblink01.netease.im:443',
-  'weblink01.netease.im:443',
   'link-ga-hz.yunxinfw.com:443',
+  'weblink01.netease.im:443',
+  'chatweblink01.netease.im:443',
   'hkpxy0.netease.im:443',
+  'weblinkoutsea01.netease.im:443',
 ].join(',')).split(',').map((s) => s.trim()).filter(Boolean);
 
 const log = (...a) => console.log(new Date().toISOString().replace('T', ' ').slice(0, 19), ...a);
