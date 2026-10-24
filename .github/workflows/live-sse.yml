@@ -1,0 +1,81 @@
+name: live-sse
+
+# 直播中「实时」抓弦月回响 —— 消费 48fan 的 SSE 弹幕流。
+#
+# 为什么必须有这个：口袋48 自己的 NIM 长连接我们连不上（匿名 / IM SDK / node-nim /
+# 日本 / 杭州出口全部 403，连错 token 也 403 ⇒ 应用级拒绝）。而 48fan 把 NIM 消息
+# 转成了公开的 HTTP SSE，直播进行中就能收到 `PRESENT_NORMAL` 送礼事件。
+#
+# 🔴 硬限制：**同一个出口 IP 最多同时挂 ~6 条弹幕流**（第 7 条 start 就 429，等多久都没用；
+#    但已建过会话的房间重连 reused 不吃配额）。所以这里用 matrix 起多个 job 分片：
+#    每个 job 是独立 runner（独立出口 IP），只负责 liveId % SHARDS == SHARD 的那一片。
+#
+# 与 LRC 补抓的关系：两边都会拿到同一场直播的礼物，时间戳口径不同，worker 的去重键对不上
+# ⇒ 会重复计分。所以本任务会把「从头实时覆盖到的场次」登记到 /api/gift/covered，
+# backfill-live-gift.mjs 扫到这些场次直接跳过；中途才参与的不登记（宁可重复也不漏）。
+#
+# 时长：单 job 上限 6 小时，跑 330 分钟后由最后一个 shard 拨下一轮接力；
+# 另有每 6 小时 cron 兜底，接力链断了也能自己恢复。
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: '跑多少分钟后主动退出'
+        default: '330'
+      shards:
+        description: '分片数（= 并发 job 数，每个 job 约 6 路）'
+        default: '10'
+  schedule:
+    - cron: '7 */6 * * *'
+
+permissions:
+  actions: write
+
+jobs:
+  stream:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        # GitHub Actions 的 matrix 需要静态值，10 片够覆盖 60 个在播场次
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    concurrency:
+      group: live-sse-${{ matrix.shard }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 消费弹幕流（分片 ${{ matrix.shard }}/10）
+        run: node live-sse-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          RUN_MINUTES: ${{ inputs.minutes || '330' }}
+          SHARDS: '10'
+          SHARD: ${{ matrix.shard }}
+          MAX_ROOMS: '7'
+          START_PER_MIN: '10'
+          GAP_MS: '7000'
+
+  # 🔴 接力必须等**所有 shard 都结束**再拨：否则 shard 0 先结束时拨了新一轮，
+  #    而老一轮的其它 shard 还在跑，同一片就会有两份实例同时挂流 ⇒ 对 48fan 压力翻倍、也容易吃 429。
+  relay:
+    needs: stream
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拨下一轮
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "本轮 ${GITHUB_WORKFLOW} 全部 shard 结束，拨下一轮"
+          gh workflow run "${{ github.workflow }}" --ref main || echo "dispatch 失败（cron 兜底会补）"

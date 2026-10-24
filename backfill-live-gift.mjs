@@ -149,18 +149,25 @@ async function loadRoster() {
 
 /* ----------------------------------------------- 站点读：cfg + 已扫场次 */
 async function loadCursor() {
-  if (!INGEST || !SITE) return { cfg: { name: '弦月回响', ids: [] }, lives: {} };
+  if (!INGEST || !SITE) return { cfg: { name: '弦月回响', ids: [] }, lives: {}, sse: {} };
   try {
     const j = await (await fetch(SITE + '/api/gift/cursor', {
       headers: { 'x-ingest-token': INGEST, Accept: 'application/json' },
     })).json();
     const cfg = (j && j.cfg) || {};
     const lives = (j && j.lives) || {};
-    log(`站点配置：目标礼物「${cfg.name || '弦月回响'}」 · 已扫直播 ${Object.keys(lives).length} 场`);
-    return { cfg: { name: cfg.name || '弦月回响', ids: Array.isArray(cfg.ids) ? cfg.ids : [] }, lives };
+    // 直播侧「实时已覆盖」的场次（live-sse-sync.mjs 登记的）—— 这些场次已经实时计入，
+    // 再扫一遍 LRC 会因为时间戳口径不同而被 worker 当成新记录 ⇒ 重复计分。
+    const sse = (j && j.sse) || {};
+    log(`站点配置：目标礼物「${cfg.name || '弦月回响'}」 · 已扫直播 ${Object.keys(lives).length} 场 · 实时已覆盖 ${Object.keys(sse).length} 场`);
+    return {
+      cfg: { name: cfg.name || '弦月回响', ids: Array.isArray(cfg.ids) ? cfg.ids : [] },
+      lives,
+      sse,
+    };
   } catch (e) {
     log('读站点游标失败（用默认 弦月回响）：' + String(e.message).slice(0, 90));
-    return { cfg: { name: '弦月回响', ids: [] }, lives: {} };
+    return { cfg: { name: '弦月回响', ids: [] }, lives: {}, sse: {} };
   }
 }
 
@@ -253,7 +260,7 @@ async function main() {
   log(`=== 直播侧「${NAME}」回放补抓 起算 ${new Date(SINCE + BJ).toISOString().slice(0, 19)} (北京) ===`);
 
   const roster = await loadRoster();
-  const { cfg, lives: scanned } = await loadCursor();
+  const { cfg, lives: scanned, sse: sseCovered } = await loadCursor();
   NAME = cfg.name || '弦月回响';
   const { memberUid } = createGiftParser(cfg, roster);
 
@@ -262,6 +269,23 @@ async function main() {
 
   // 待处理：未扫过（或 FORCE）且有回放文件
   const todo = sessions.filter((s) => FORCE || !scanned[s.liveId]);
+
+  // 🔴 实时已覆盖的场次跳过（2026-10-25）：直播中的礼物已由 live-sse-sync.mjs 实时上报，
+  //    再扫一遍 LRC 会因为时间戳口径不同（serverTime vs ctime+偏移）被 worker 当成新记录 ⇒ 重复计分。
+  //    判定：SSE 首次建连时间 <= 开播时间 + 5 分钟 ⇒ 从头就在看，可以放心跳过。
+  //    中途才参与的不跳过（宁可重复也不能漏）。
+  const sseSkip = [];
+  const todo2 = todo.filter((s) => {
+    const first = Number(sseCovered[String(s.liveId)] || 0);
+    if (!first) return true;
+    const ctimeMs = Number(s.ctime) || 0;
+    if (first <= ctimeMs + 5 * 60000) { sseSkip.push(s.liveId); return false; }
+    return true;
+  });
+  if (sseSkip.length) log(`实时已覆盖 ${sseSkip.length} 场，跳过不重复扫`);
+  todo.length = 0;
+  todo.push(...todo2);
+
   log(`${FORCE ? 'FORCE 全量' : '未扫'} ${todo.length} 场待处理${LIMIT ? '（限 ' + LIMIT + '）' : ''}`);
   if (LIMIT) todo.length = Math.min(todo.length, LIMIT);
 
