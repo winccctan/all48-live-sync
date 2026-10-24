@@ -125,16 +125,37 @@ function parseGift(m, member) {
   };
 }
 
-/* ---------- ② 成员目录（取站点的静态资源，避免再维护一份名单） ---------- */
+/* ---------- ② 成员目录（取站点的静态资源，避免再维护一份名单） ----------
+   🔴 2026-10-25 起 `/data/members.js` 是 Worker **动态拼**的：
+      静态快照 + 官方全团表（团/队）+ KV roster:extra（新人）。
+      带 ?v= 是为了绕开边缘缓存（那边 Cache-Control 是 120 秒，快扫本身就只有 2 分钟一轮）。
+      再加一层「直读补充名册」兜底：万一动态生成失败退回静态文件，
+      没这一层就会漏掉新人房间，一直等到静态名册重新部署。 */
 const catalog = new Map();
 try {
-  const txt = await (await site('/data/members.js')).text();
+  const txt = await (await site('/data/members.js?v=' + Date.now())).text();
   const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
   for (const m of arr) catalog.set(Number(m.id), m);
   log(`成员目录 ${catalog.size} 人`);
 } catch (e) {
   log('读成员目录失败：' + e.message);
   process.exit(1);
+}
+try {
+  const j = await (await site('/api/roster/extra')).json();
+  let add = 0;
+  for (const r of (Array.isArray(j && j.rows) ? j.rows : [])) {
+    const uid = Number(r && r[0]) || 0;
+    if (!uid || catalog.has(uid)) continue;
+    const srv = Number(r[5]) || 0;
+    const ch = Number(r[6]) || 0;
+    if (!srv || !ch) continue;            // 没有房间就扫不了，等 discover 补上再扫
+    catalog.set(uid, { id: uid, n: String(r[1] || ''), g: String(r[2] || ''), tm: String(r[3] || ''), srv, ch });
+    add += 1;
+  }
+  if (add) log(`补充名册合并 ${add} 人（新人房间）`);
+} catch (e) {
+  log('读补充名册失败（不影响本轮）：' + String(e.message).slice(0, 80));
 }
 
 // 只扫「有房间、且不是荣誉毕业生」的人（毕业生房间已凉，白烧代理额度）

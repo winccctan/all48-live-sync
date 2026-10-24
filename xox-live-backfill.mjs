@@ -139,8 +139,11 @@ async function siteGet(path) {
 }
 
 /* ------------------------------------------------------- 成员目录 */
+// 🔴 /data/members.js 自 2026-10-25 起是 Worker 动态拼的（静态 + 官方团/队 + KV roster:extra）。
+//    带 ?v= 绕开 120 秒边缘缓存：这一轮的「新人」判定要用最新名册，
+//    否则刚补进来的人会被当成新人再推一遍（幂等，但白跑一趟官方表）。
 async function loadRoster() {
-  const txt = await (await fetch(SITE + '/data/members.js', { headers: { 'user-agent': UA } })).text();
+  const txt = await (await fetch(SITE + '/data/members.js?v=' + Date.now(), { headers: { 'user-agent': UA } })).text();
   const arr = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
   const byName = new Map();   // 昵称(去空格) → uid
   const byId = new Map();

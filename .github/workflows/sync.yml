@@ -47,6 +47,37 @@ jobs:
           FORCE_UIDS: ${{ inputs.force_uids }}
           MAX_MEMBERS: '600'
 
+  # 成员发现（补新人 / 补房间）
+  # ------------------------------------------------------------------
+  # 站长 2026-10-25：「这里的成员也要补齐呀」「新成员有办法实时补吗」
+  # 名册是静态快照，运营随时补人，而新人一开播就该自动上榜、房间就该被扫到。
+  # 这里翻最近几天的直播历史，凡是不在名册里的主播 → server/jump 拿房间
+  # → POST /api/roster/extra。worker 的 /data/members.js 是「静态 + 官方表 + 补充名册」
+  # 动态拼的，所以页面和抓取端会同时看到新人，不用重新部署。
+  # 🔴 每轮只翻 20 页（≈400 条，覆盖最近约 5 天），够接住刚出道的人；
+  #    漏掉的由 xox48 对账那条通道（每 2 分钟）按分数兜底补进来。
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 从直播历史发现新成员
+        run: node discover-members.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          PAGES: '20'
+          DAYS: '30'
+
   # 红蓝活动 · 礼物计分（弦月回响）已经拆到 gift-fast.yml：
   # 房间礼物要「实时」就得把轮询做密（2 分钟一轮），15 分钟一轮的节奏够不上。
   # 那边由站点 Worker 的 cron 直接拨，跟本工作流互不干扰。
