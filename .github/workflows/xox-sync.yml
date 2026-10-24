@@ -68,3 +68,32 @@ jobs:
           # xox48 并发打高了会掐连接（undici 报 other side closed），2 是实测稳的上限
           CONC: '2'
           TOL: '20'
+
+  # 房间补洞（轻量，跟对账同频）
+  # ------------------------------------------------------------------
+  # 站长 2026-10-25：「这里的成员也要补齐呀」。
+  # 名册里的人分两处会漏房间号：① xox 对账只补名字（它没有房间号）；
+  # ② 刚出道的新人压根不在名册里。两种人 jump 一次就能拿到当前 serverId/channelId，
+  # 拿不到房间 = 抓取端永远扫不到她 → 榜上有名字、点进去一片空白。
+  # 每轮只翻 1 页直播历史（20 条，1 秒）+ 最多补 12 个空房间，成本极小。
+  fillrooms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 补齐名册里没有房间的成员
+        run: node discover-members.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          PAGES: '1'
+          DAYS: '2'
