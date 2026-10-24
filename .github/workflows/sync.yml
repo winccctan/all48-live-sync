@@ -16,6 +16,9 @@ on:
       force_uids:
         description: '只抓这几个 uid（逗号分隔，留空=全员）'
         default: ''
+      discover_pages:
+        description: '成员发现往回翻几页（20 ≈ 最近 5 天；补历史可临时调到 300）'
+        default: '20'
 
 permissions:
   contents: read
@@ -75,7 +78,7 @@ jobs:
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
-          PAGES: '20'
+          PAGES: ${{ inputs.discover_pages || '20' }}
           DAYS: '30'
 
   # 红蓝活动 · 礼物计分（弦月回响）已经拆到 gift-fast.yml：
