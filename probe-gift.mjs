@@ -27,8 +27,7 @@ console.log('成员目录 ' + all.length + ' 人');
 const pick = (process.env.PROBE_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
 let sample = all.filter((m) => m.srv && m.ch && m.tm && String(m.tm).indexOf('荣誉') < 0);
 if (pick.length) sample = all.filter((m) => pick.includes(Number(m.id)));
-else sample = sample.slice(0, 4);
-
+else sample = sample.slice(0, Number(process.env.PROBE_MEMBERS || 12));
 /** 试一个接口路径，返回 message 数组 */
 async function tryPath(path, m, token) {
   try {
@@ -49,6 +48,7 @@ const PATHS = [
 ];
 
 const giftNames = new Map();
+const giftPairs = new Map(); // "giftId|giftName" → 次数，用来反推「弦月回响」的 giftId
 const giftSamples = [];
 let grand = { msgs: 0, fan: 0, gift: 0 };
 
@@ -74,6 +74,8 @@ for (const path of PATHS) {
         const gi = ct.giftInfo || {};
         const name = String(gi.giftName || '');
         giftNames.set(name, (giftNames.get(name) || 0) + 1);
+        const pk = String(gi.giftId) + '|' + name;
+        giftPairs.set(pk, (giftPairs.get(pk) || 0) + 1);
         if (giftSamples.length < 8) {
           giftSamples.push({
             member: m.n, memberId: m.id,
@@ -98,5 +100,6 @@ console.log('\n===== 汇总 =====');
 console.log(`两个接口合计 ${grand.msgs} 条：非房主 ${grand.fan} / GIFT_TEXT ${grand.gift}`);
 console.log('礼物名 TOP：' + JSON.stringify([...giftNames.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)));
 console.log('含「弦月」的礼物：' + JSON.stringify([...giftNames.keys()].filter((n) => n.indexOf('弦月') >= 0)));
+console.log('(giftId|name) 全量：' + JSON.stringify([...giftPairs.entries()]));
 console.log('\nGIFT_TEXT 样本：');
 for (const s of giftSamples) console.log('  ' + JSON.stringify(s));

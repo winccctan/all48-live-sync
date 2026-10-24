@@ -13,6 +13,9 @@ on:
       limit:
         description: '每人取多少条消息'
         default: '100'
+      members:
+        description: '自动抽样人数（uids 留空时生效）'
+        default: '12'
 
 permissions:
   contents: read
@@ -36,3 +39,4 @@ jobs:
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           PROBE_UIDS: ${{ inputs.uids }}
           PROBE_LIMIT: ${{ inputs.limit }}
+          PROBE_MEMBERS: ${{ inputs.members }}
