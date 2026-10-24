@@ -1,0 +1,30 @@
+[Unit]
+Description=48 红蓝歌会 · 直播礼物实时监听（NIM 长连接）
+Documentation=https://all48.wyc0518.cc/gift
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/all48-live-sync
+EnvironmentFile=/opt/all48-live-sync/nim-sync.env
+# 状态目录（未上报的队列 spool + 消息采样）
+Environment=NIM_STATE=/var/lib/all48-nim
+ExecStart=/usr/bin/node live-nim-sync.mjs
+Restart=always
+RestartSec=5
+# 进程被 OOM 或 SDK 卡死时，5 秒内拉起；连续重启过多才彻底放弃
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=all48-nim
+
+# 安全加固（只需要出网 + 写状态目录）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/all48-nim
+
+[Install]
+WantedBy=multi-user.target

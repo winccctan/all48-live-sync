@@ -5,6 +5,11 @@
   "description": "48 成员档案 · 实时数据搬运（口袋48 → Cloudflare）",
   "scripts": {
     "sync": "node sync.mjs",
-    "dry": "DRY=1 node sync.mjs"
+    "dry": "DRY=1 node sync.mjs",
+    "nim": "node live-nim-sync.mjs"
+  },
+  "dependencies": {
+    "@yxim/nim-web-sdk": "^9.21.18",
+    "xhr2": "^0.2.1"
   }
 }
