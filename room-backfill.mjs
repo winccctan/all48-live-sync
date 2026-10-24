@@ -129,7 +129,7 @@ async function ingest(items) {
     const res = await fetch(SITE + '/api/gift/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
-      body: JSON.stringify({ items: chunk, stats: { '房间回填': chunk.length } }),
+      body: JSON.stringify({ items: chunk, ch: 'im', stats: { '房间回填': chunk.length } }),
     });
     const out = await res.json().catch(() => ({}));
     log(`  ↑ 上报 ${chunk.length} → kept=${out.kept} added=${out.added}`);

@@ -248,7 +248,9 @@ if (!chunks.length) chunks.push([]);   // 没有礼物也要上报：游标和 s
 
 for (let i = 0; i < chunks.length; i++) {
   const last = i === chunks.length - 1;
-  const body = { items: chunks[i] };
+  // ch='im'：批级通道标识。worker 用它在模糊去重时区分通道——
+  // 同通道内 5 秒内的两条是「真的连送两次」，不能压（详见 worker 里 FUZZ_TOL 注释）
+  const body = { items: chunks[i], ch: 'im' };
   if (last) {
     // 游标整张表跟最后一批走（470 人 ≈ 10KB，一次写完；Worker 侧一次写一个键，不会 470 次写）
     body.cursors = newCur;

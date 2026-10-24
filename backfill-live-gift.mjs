@@ -260,6 +260,7 @@ async function ingest(items, lives) {
       headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
       body: JSON.stringify({
         items: chunk,
+        ch: 'lrc',
         stats: { ['直播补抓·' + NAME]: chunk.length },
       }),
     });

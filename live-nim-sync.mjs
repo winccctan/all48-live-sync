@@ -349,7 +349,7 @@ async function flush() {
     const res = await site('/api/gift/ingest', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
-      body: JSON.stringify({ items: batch, stats: { [`[直播]${target.name}`]: batch.length } }),
+      body: JSON.stringify({ items: batch, ch: 'nim', stats: { [`[直播]${target.name}`]: batch.length } }),
     }, { timeout: 20000, retries: 1 });
     const out = await res.json().catch(() => ({}));
     queue.splice(0, batch.length);

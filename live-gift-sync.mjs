@@ -211,7 +211,7 @@ try {
   const res = await fetch(SITE + '/api/gift/ingest', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
-    body: JSON.stringify({ items, lives: newLives }),
+    body: JSON.stringify({ items, ch: 'lrc', lives: newLives }),
   });
   const out = await res.json();
   log('上报结果：' + JSON.stringify(out));

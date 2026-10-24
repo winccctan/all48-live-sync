@@ -238,7 +238,7 @@ async function ingest(items) {
       // 🔴 reconciled:true —— 这一批已经在本地做过 20 分钟窗口对账，让 worker 跳过 15 秒模糊去重。
       //    不跳的话「同一个人连送 N 次、我们少抓到中间那条」永远补不上：
       //    判缺的条目会撞上邻座那条毫秒级的已有记录，被当重复拦掉（见 worker handleGiftIngest 注释）。
-      body: JSON.stringify({ items: chunk, reconciled: true, stats: { 'xox48补差': chunk.length } }),
+      body: JSON.stringify({ items: chunk, ch: 'xox', reconciled: true, stats: { 'xox48补差': chunk.length } }),
     });
     const out = await r.json().catch(() => ({}));
     added += Number(out && out.added) || 0;

@@ -339,7 +339,7 @@ async function flush() {
       method: 'POST',
       // 🔴 必须带 UA：worker 在 Cloudflare 上，Bot Fight 会拦「无 UA 的 POST」直接回 405
       headers: { 'content-type': 'application/json', 'x-ingest-token': TOKEN, 'user-agent': 'all48-live-sse/1.0' },
-      body: JSON.stringify({ items }),
+      body: JSON.stringify({ items, ch: 'sse' }),
       signal: AbortSignal.timeout(30000),
     });
     const d = await r.json().catch(() => ({}));
