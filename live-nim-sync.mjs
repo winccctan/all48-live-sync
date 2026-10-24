@@ -32,20 +32,35 @@ import { createRequire } from 'node:module';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-// 🔴 代理必须在 import lib/api.mjs **之前**清掉：
-//    那个模块在加载时就把 SCRAPE_PROXY/HTTPS_PROXY 算成代理列表并打印，
-//    而这台机器要求**国内直连**——一旦被环境里的海外代理劫走，口袋接口立刻 403。
-//    确实需要代理时（比如临时调试）显式给 USE_PROXY=1。
-if (!process.env.USE_PROXY) {
+/**
+ * 代理策略（2026-10-24 更新，两种跑法）
+ *
+ * A. 国内机器（推荐）：**直连**。把环境里的 HTTP(S)_PROXY 全部清掉——
+ *    一旦被海外代理劫走，口袋接口立刻 403。什么都不用配。
+ *
+ * B. 手边没有国内机器：给 `NIM_PROXY=<http 代理>`，或 `USE_PROXY=1` 沿用 `SCRAPE_PROXY`。
+ *    这时会把 globalThis.WebSocket 换成走 CONNECT 隧道的实现（lib/ws-proxy.mjs），
+ *    于是长连接也从这个代理的出口出去。
+ *    🔴 实测（2026-10-24，出口 = 杭州阿里云）：weblink01 / chatweblink01 / hkpxy0 /
+ *       weblinkoutsea01 的 WS 握手全部成功，link-ga-hz 反而不通（它要纯直连）。
+ */
+const PROXY_URL = (process.env.NIM_PROXY
+  || (process.env.USE_PROXY === '1' ? (process.env.SCRAPE_PROXY || '') : ''))
+  .split(',')[0].trim();
+
+if (!PROXY_URL) {
   for (const k of ['SCRAPE_PROXY', 'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) {
     if (process.env[k]) {
       console.log(`[代理] 忽略 ${k}=${String(process.env[k]).replace(/\/\/[^@/]*@/, '//***@')}（这台机器直连，见 deploy/README.md）`);
       delete process.env[k];
     }
   }
+} else {
+  console.log(`[代理] 长连接走代理 ${PROXY_URL.replace(/\/\/[^@/]*@/, '//***@')}（HTTP 请求也用它）`);
 }
 const { postJson } = await import('./lib/api.mjs');
 import { createGiftParser } from './lib/nim-parse.mjs';
+import { installProxyWebSocket, proxyWsSnapshot } from './lib/ws-proxy.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -94,6 +109,15 @@ const LINKS = String(process.env.NIM_LINKS || [
 
 const log = (...a) => console.log(new Date().toISOString().replace('T', ' ').slice(0, 19), ...a);
 const warn = (...a) => console.warn(new Date().toISOString().replace('T', ' ').slice(0, 19), ...a);
+
+// 🔴 必须在 SDK 被 require 之前接管 WebSocket（SDK 是懒加载，这里够早）
+if (PROXY_URL) {
+  try {
+    installProxyWebSocket(PROXY_URL, log);
+  } catch (e) {
+    warn('接管 WebSocket 失败：' + String(e.message).slice(0, 160));
+  }
+}
 
 if (!SITE) { console.error('缺少 SITE_URL'); process.exit(1); }
 if (!TOKEN) { console.error('缺少 POCKET48_TOKEN（口袋48 登录 token）'); process.exit(1); }
@@ -246,9 +270,14 @@ function probeLink(hostPort) {
   });
 }
 
+/** 代理模式下 link-ga-hz 排最后：它要求纯国内直连，经 CONNECT 隧道握手会被断 */
+const LINK_ORDER = PROXY_URL
+  ? LINKS.filter((l) => !l.startsWith('link-ga-hz')).concat(LINKS.filter((l) => l.startsWith('link-ga-hz')))
+  : LINKS;
+
 async function pickLink() {
   const results = [];
-  for (const l of LINKS) {
+  for (const l of LINK_ORDER) {
     const ok = await probeLink(l);
     results.push(l + '=' + (ok ? 'OK' : '×'));
     if (ok) { stat.link = l; log('节点探测：' + results.join('  ') + ` ⇒ 用 ${l}`); return l; }
@@ -568,8 +597,9 @@ function snapshot() {
   return {
     ok: !stat.tokenBad,
     up: Math.round((Date.now() - startedAt) / 1000),
-    mode: 'nim-live',
+    mode: PROXY_URL ? 'nim-live+proxy' : 'nim-live',
     link: stat.link,
+    proxy: PROXY_URL ? { on: true, ws: proxyWsSnapshot() } : null,
     target: stat.cfg,
     tokenBad: stat.tokenBad,
     stats: {

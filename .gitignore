@@ -3,3 +3,5 @@ node_modules/
 *.log
 # live-nim-sync 的状态目录（未上报队列 spool + NIM 消息采样）
 nim-state/
+nim-sync.env
+nim-sync.pid
