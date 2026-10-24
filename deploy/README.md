@@ -60,7 +60,8 @@ curl -s localhost:8788/healthz | head -40
 | `tokenBad` | `false` | `true` = 口袋 token 过期 / 出口 IP 被拦 |
 | `stats.msgs` | 一直在涨 | 不涨 = 没进到房 / 房间里没人说话 |
 | `stats.hits` | 活动期间会涨 | 一直 0 = 要么真没人送，要么解析没认出来（见下） |
-| `unstable` | `0` | >0 = 有房间连续进房即断（多半是同一 accid 多连接被踢，把 `NIM_ROOMS_MAX` 降到 1~2） |
+| `roomsMax` | `all` | 数字 = 只监听前 N 场（`NIM_ROOMS_MAX`）；设 0 才是全部 |
+| `unstable` | `0` | >0 = 有房间连续进房即断（多半是同一 accid 多连接被踢，先降 `NIM_ROOMS_MAX` 到 8~12 试，仍踢则需多账号） |
 | `rooms[].state` | `on` | `down/entering` 反复 = 该房间进不去 |
 
 ## 认不出礼物怎么办（NIM_DUMP）
@@ -88,7 +89,7 @@ head -3 /var/lib/all48-nim/samples/*.jsonl
 | 日志 `节点全部不通` | 机器不是国内出口 / 防火墙封 443 | 换机器；或 `iptables -L` 看出口规则 |
 | 日志 `在播列表失败 ... 403` | 口袋48 按 IP 拦 | 确认是国内 IP；家宽动态 IP 变了要重拨 |
 | `tokenBad: true` | `POCKET48_TOKEN` 过期 | 重新拿 token，改 `nim-sync.env`，`systemctl restart` |
-| `unstable` 一直涨 | 同 accid 多连接互踢 | `NIM_ROOMS_MAX=1`（只能听在线最高的那场） |
+| `unstable` 一直涨 | 同 accid 多连接互踢 | 先 `NIM_ROOMS_MAX=8~12` 观察；仍涨说明单账号撑不住，得拆多账号（每个账号一套 `POCKET48_TOKEN` → 各自 accid/pwd，分房间跑多个进程） |
 | 收到礼物但榜单没变 | `mid` 归户失败（昵称不在成员目录） | 日志里会有 `直播礼物归户失败：「X」不在成员目录里` |
 | 进程反复重启 | 依赖没装好 | `cd /opt/all48-live-sync && npm i --omit=dev` 看报错 |
 

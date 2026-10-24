@@ -87,7 +87,15 @@ const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const APPKEY = process.env.NIM_APPKEY || '632feff1f4c838541ab75195d1ceb3fa';
-const ROOMS_MAX = Math.max(1, Number(process.env.NIM_ROOMS_MAX || 6));
+// 🔴 NIM_ROOMS_MAX = 同时监听的**直播间场次数**（一个 liveId 一条 WS），不是成员数。
+//    0（或负数）= 全部在播场次都听，不砍（另受 ROOMS_HARD=60 硬上限兜底）。
+//    2026-10-24 站长拍板：6 不够，全团随时可能十几场同时开，漏一场就漏分。
+//    唯一真实限制是「同一 accid 多连接会不会被云信互踢」——靠 healthz 的
+//    unstable 字段观测：一直涨就说明要拆成多账号（见 deploy/README.md）。
+const ROOMS_MAX_CFG = Number(process.env.NIM_ROOMS_MAX ?? 6);
+const ROOMS_HARD = 60;   // 硬上限，防止误配成天文数字把进程拖死
+const ROOMS_MAX = ROOMS_MAX_CFG <= 0 ? ROOMS_HARD : Math.min(ROOMS_HARD, ROOMS_MAX_CFG);
+const ROOMS_ALL = ROOMS_MAX_CFG <= 0;
 const PORT = Number(process.env.NIM_PORT === undefined ? 8788 : process.env.NIM_PORT);
 const BIND = process.env.NIM_BIND || '127.0.0.1';
 const SCAN_MS = Math.max(20, Number(process.env.NIM_SCAN || 60)) * 1000;      // 在播重扫
@@ -575,7 +583,7 @@ async function scanOnce() {
   const listen = [...rooms.values()];
   const notListened = list.filter((x) => !rooms.has(x.liveId)).length;
   if (notListened > 0) {
-    log(`（还有 ${notListened} 场在播没听：已达 NIM_ROOMS_MAX=${ROOMS_MAX}，可按需调大）`);
+    log(`🔴 还有 ${notListened} 场在播没听：已达 NIM_ROOMS_MAX=${ROOMS_MAX}（设 0 = 全部监听）`);
   }
   // 上一轮进房失败（state=down 且没有挂着重连定时器）的，这轮再给一次机会
   for (const room of rooms.values()) {
@@ -599,6 +607,8 @@ function snapshot() {
     up: Math.round((Date.now() - startedAt) / 1000),
     mode: PROXY_URL ? 'nim-live+proxy' : 'nim-live',
     link: stat.link,
+    roomsMax: ROOMS_ALL ? 'all' : ROOMS_MAX,
+    listening: list.length,
     proxy: PROXY_URL ? { on: true, ws: proxyWsSnapshot() } : null,
     target: stat.cfg,
     tokenBad: stat.tokenBad,
@@ -690,7 +700,7 @@ async function boot() {
     }
   }, 120000);
 
-  log(`启动完成：最多同时监听 ${ROOMS_MAX} 个直播间，在播每 ${SCAN_MS / 1000}s 重扫，上报每 ${FLUSH_MS / 1000}s 一次`);
+  log(`启动完成：${ROOMS_ALL ? '全部在播场次都监听（NIM_ROOMS_MAX=0）' : '最多同时监听 ' + ROOMS_MAX + ' 个直播间'}，在播每 ${SCAN_MS / 1000}s 重扫，上报每 ${FLUSH_MS / 1000}s 一次`);
 }
 
 let exiting = false;
