@@ -39,8 +39,11 @@ jobs:
           unzip -oq /tmp/nn.zip -d "$RUNNER_TEMP/nim"
           echo "解压内容："; ls "$RUNNER_TEMP/nim"
           # 兼容 zip 里带/不带顶层 node-nim 目录
-          if [ -d "$RUNNER_TEMP/nim/node-nim" ]; then echo "NODE_NIM_PATH=$RUNNER_TEMP/nim/node-nim" >> "$GITHUB_ENV";
-          else echo "NODE_NIM_PATH=$RUNNER_TEMP/nim" >> "$GITHUB_ENV"; fi
+          if [ -d "$RUNNER_TEMP/nim/node-nim" ]; then P="$RUNNER_TEMP/nim/node-nim"; else P="$RUNNER_TEMP/nim"; fi
+          echo "NODE_NIM_PATH=$P" >> "$GITHUB_ENV"
+          export NODE_NIM_PATH="$P"      # 🔴 同一 step 内 $GITHUB_ENV 不生效，必须自己 export
+          echo "路径 = $P"
+          ls "$P" | head -10
           node -e "const p=require(process.env.NODE_NIM_PATH+'/package.json');console.log('node-nim 版本',p.version)" || echo "⚠️ 模块加载失败"
 
       - name: 配 proxychains
