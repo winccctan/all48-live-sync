@@ -1,0 +1,39 @@
+# 探针：经国内代理做 NIM 直播间登录（web SDK 单房间最小复现）
+#
+# 背景：本机在日本直连/日本代理登录一律 403 Forbidden；
+#       Actions 里的 SCRAPE_PROXY 出口是 114.55.246.231（杭州阿里云，国内）。
+#       这个 workflow 就是验证「国内出口能不能登录成功并收到消息」。
+name: 探针 · NIM 登录
+
+on:
+  workflow_dispatch:
+    inputs:
+      nick:
+        description: '进哪个成员的直播间（留空=随便一个在播）'
+        default: ''
+      sec:
+        description: '监听多少秒'
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 装依赖
+        run: npm i @yxim/nim-web-sdk xhr2 https-proxy-agent --no-audit --no-fund --cache /tmp/npmcache
+      - name: 单房间登录测试
+        run: node probe-one.mjs
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          USE_PROXY: '1'
+          NICK: ${{ inputs.nick }}
+          SEC: ${{ inputs.sec }}
