@@ -33,8 +33,6 @@ import { fetchMessagePage } from './lib/api.mjs';
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
-const TARGET = String(process.env.GIFT_NAME || '弦月回响').trim();
-const EXTRA_IDS = new Set(String(process.env.GIFT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean));
 const CONC = Math.max(1, Number(process.env.CONC || 6));
 const PAGES = Math.max(1, Number(process.env.GIFT_PAGES || 3));
 const MAX_MEMBERS = Number(process.env.MAX_MEMBERS || 600);
@@ -72,10 +70,32 @@ async function site(path, init, { timeout = 90000, retries = 2 } = {}) {
   throw lastErr;
 }
 
+/* ---------- ① 游标 + 目标礼物配置（都存站点） ----------
+   🔴 目标礼物名/ID 由站点下发而不是写死在这里：活动打分道具会改名
+      （888xxx 那批 2023 年改名前直接叫「0.1分 / 1分 / 9分 / 99分」），
+      改一次配置就生效，不用改代码重新推。env 里的值只作为兜底。 */
+let cursors = {};
+let TARGET = String(process.env.GIFT_NAME || '弦月回响').trim();
+let EXTRA_IDS = new Set(String(process.env.GIFT_IDS || '').split(',').map((s) => s.trim()).filter(Boolean));
+try {
+  const j = await (await site('/api/gift/cursor', {
+    headers: { 'x-ingest-token': INGEST },
+  })).json();
+  cursors = (j && j.cur) || {};
+  if (j && j.cfg) {
+    if (j.cfg.name) TARGET = String(j.cfg.name).trim();
+    if (Array.isArray(j.cfg.ids) && j.cfg.ids.length) EXTRA_IDS = new Set(j.cfg.ids.map(String));
+  }
+  log(`游标 ${Object.keys(cursors).length} 人 · 目标礼物「${TARGET}」` +
+    (EXTRA_IDS.size ? ' + id 白名单 ' + [...EXTRA_IDS].join(',') : ''));
+} catch (e) {
+  log('读游标/配置失败（用 env 默认值，本轮多扫一点）：' + String(e.message).slice(0, 90));
+}
+
 /** 这条礼物是否计入（名字或 giftId 命中） */
 function isTarget(gid, gname) {
   const n = String(gname || '').trim();
-  if (n && n.indexOf(TARGET) >= 0) return true;
+  if (n && TARGET && n.indexOf(TARGET) >= 0) return true;
   return EXTRA_IDS.has(String(gid || ''));
 }
 
@@ -105,18 +125,6 @@ function parseGift(m, member) {
   };
 }
 
-/* ---------- ① 游标（站点存） ---------- */
-let cursors = {};
-try {
-  const j = await (await site('/api/gift/cursor', {
-    headers: { 'x-ingest-token': INGEST },
-  })).json();
-  cursors = (j && j.cur) || {};
-  log(`游标 ${Object.keys(cursors).length} 人`);
-} catch (e) {
-  log('读游标失败（当作全空，本轮多扫一点）：' + String(e.message).slice(0, 90));
-}
-
 /* ---------- ② 成员目录（取站点的静态资源，避免再维护一份名单） ---------- */
 const catalog = new Map();
 try {
@@ -142,7 +150,8 @@ log(`本轮扫 ${uids.length} 个房间` + (DRY ? '（DRY）' : ''));
 
 /* ---------- ③ 逐房间扫 ---------- */
 const items = [];
-const stats = {};          // 本轮见到的所有礼物名 → 次数（用于核对「弦月回响」写法）
+const stats = {};          // 本轮见到的所有礼物名 → 次数（用于核对目标礼物写法）
+const ids = {};            // giftId → 礼物名（用来认出 888xxx 活动道具的真实 id）
 const newCur = {};
 let okCount = 0, errCount = 0, emptyCount = 0, pageTotal = 0;
 let cur = 0;
@@ -173,6 +182,7 @@ async function memberWorker() {
           got++;
           const nm = g.g || ('gid:' + g.gid);
           stats[nm] = (stats[nm] || 0) + 1;
+          if (g.gid) ids[g.gid] = g.g;
           if (!isTarget(g.gid, g.g)) continue;
           if (since && g.t <= since) continue;   // 已经上报过
           items.push(g);
@@ -197,7 +207,10 @@ await Promise.all(Array.from({ length: Math.min(CONC, uids.length) }, memberWork
 log(`扫描完成：有礼物 ${okCount} 房间 / 无礼物 ${emptyCount} / 失败 ${errCount} · 翻页 ${pageTotal} 次 · ` +
   `命中目标 ${items.length} 条 · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 log('见过的礼物：' + JSON.stringify(Object.entries(stats).sort((a, b) => b[1] - a[1]).slice(0, 25)));
-if (!stats[TARGET]) log(`⚠️ 本轮没见到「${TARGET}」——若多轮都没见到，说明礼物名改了，去 /api/gift?probe=1 核对`);
+// 6 位 888xxx = 活动打分道具（正常礼物是 18~19 位）。目标礼物如果是活动道具，这里一定能看到它的 id
+const actIds = Object.entries(ids).filter(([id]) => /^88\d{4}$/.test(id));
+if (actIds.length) log('★ 888xxx 活动道具：' + JSON.stringify(actIds));
+if (!stats[TARGET]) log(`⚠️ 本轮没见到「${TARGET}」——若多轮都没见到，去 /api/gift?probe=1 核对名字和 id`);
 
 if (DRY) {
   console.log('\n[DRY] 不上报');
@@ -219,6 +232,7 @@ for (let i = 0; i < chunks.length; i++) {
     // 游标整张表跟最后一批走（470 人 ≈ 10KB，一次写完；Worker 侧一次写一个键，不会 470 次写）
     body.cursors = newCur;
     body.stats = stats;
+    body.ids = ids;
   }
   try {
     const res = await site('/api/gift/ingest', {
