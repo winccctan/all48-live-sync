@@ -27,7 +27,9 @@ jobs:
         with:
           node-version: '22'
       - name: 探测
-        run: node probe-gift.mjs
+        run: |
+          node probe-gift.mjs
+          node probe-giftnames.mjs
         env:
           SITE_URL: ${{ vars.SITE_URL }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
