@@ -64,11 +64,21 @@ NPM="$NODE_DIR/npm"
 
 # ---------- ② 代码 ----------
 say "拉代码到 $APP"
-if [ -d "$APP/.git" ]; then
-  (cd "$APP" && git pull -q --ff-only) || echo "（git pull 失败，继续用现有代码）"
+# 🔴 新 Mac 上 /usr/bin/git 只是个占位，没装 Xcode 命令行工具时一调就弹窗卡住。
+#    所以先用 `git --version` 试一下，不行就走 tarball，全程不依赖 git。
+if git --version >/dev/null 2>&1; then
+  if [ -d "$APP/.git" ]; then
+    (cd "$APP" && git pull -q --ff-only) || echo "（git pull 失败，继续用现有代码）"
+  else
+    mkdir -p "$(dirname "$APP")"
+    git clone -q --depth 1 "$REPO" "$APP"
+  fi
 else
-  mkdir -p "$(dirname "$APP")"
-  git clone -q --depth 1 "$REPO" "$APP"
+  echo "没有可用的 git，改用压缩包下载"
+  mkdir -p "$APP"
+  curl -fL --max-time 300 "https://github.com/winccctan/all48-live-sync/archive/refs/heads/main.tar.gz" \
+    | tar -xz -C "$APP" --strip-components=1 \
+    || die "代码下载失败（检查网络，或先装 git）"
 fi
 cd "$APP"
 
