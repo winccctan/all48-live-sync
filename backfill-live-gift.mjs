@@ -165,7 +165,7 @@ const fetchLrc = (url) => fetchText(url, { timeout: 40000 });
 async function collectSessions() {
   const all = [];
   let next = '0';
-  for (let p = 0; p < 30; p++) {
+  for (let p = 0; p < 40; p++) {
     const r = await postJson('/live/api/v1/live/getLiveList',
       { debug: true, next: String(next), record: true }, { token: TOKEN, retries: 3 });
     const c = (r && r.content) || {};
@@ -173,7 +173,6 @@ async function collectSessions() {
     if (!list.length) break;
     for (const x of list) {
       const ctime = Number(x.ctime) || 0;
-      if (ctime < SINCE) { p = 999; break; }   // 已翻到起点之前
       all.push({
         liveId: String(x.liveId || ''),
         uid: String((x.userInfo && x.userInfo.userId) || ''),
@@ -181,15 +180,23 @@ async function collectSessions() {
         ctime,
       });
     }
-    if (p === 999) break;
     const nx = String(c.next || '0');
     if (!nx || nx === '0' || nx === String(next)) break;
     next = nx;
+    // 🔴 整页都早于起点才停（原来是「页内碰到一个早于起点的就 break」，
+    //    列表只要有一场 ctime 乱序就会整批截断 —— 实测因此漏了 10 场）
+    const times = list.map((x) => Number(x.ctime) || 0).filter(Boolean);
+    if (times.length && Math.max(...times) < SINCE) break;
   }
-  // 去重（同一 liveId 可能翻到两次）
+  // 去重 + 过滤起点
   const seen = new Set();
   const uniq = [];
-  for (const s of all) { if (s.liveId && !seen.has(s.liveId)) { seen.add(s.liveId); uniq.push(s); } }
+  for (const s of all) {
+    if (!s.liveId || seen.has(s.liveId)) continue;
+    if (s.ctime < SINCE) continue;          // 起点之前的不扫
+    seen.add(s.liveId);
+    uniq.push(s);
+  }
   return uniq;
 }
 

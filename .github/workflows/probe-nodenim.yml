@@ -1,0 +1,71 @@
+# 探针：node-nim（云信 C++ SDK）+ 国内代理 = qqtools 同款链路
+#
+# 为什么这么绕：
+#   · web SDK 的 Chatroom.getInstance({account,token}) 一律 403 / 13_2，国内出口也一样；
+#   · qqtools 用的是 node-nim（C++ 绑定），四步入房，但它**不认 HTTPS_PROXY**；
+#   · GitHub runner 在海外 ⇒ 用 proxychains4 给 native 程序强制套 CONNECT 隧道。
+name: 探针 · node-nim 登录
+
+on:
+  workflow_dispatch:
+    inputs:
+      nick:
+        description: '进哪个成员的直播间（留空=随便一个在播）'
+        default: ''
+      sec:
+        description: '监听多少秒'
+        default: '60'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 装依赖
+        run: npm i xhr2 --no-audit --no-fund --cache /tmp/npmcache
+
+      - name: 下载 node-nim (linux64)
+        run: |
+          curl -sL -o /tmp/nn.zip https://github.com/duan602728596/48tools-nim-node-build/releases/download/v202406100105/node-nim-linux64.zip
+          mkdir -p "$RUNNER_TEMP/nim"
+          unzip -oq /tmp/nn.zip -d "$RUNNER_TEMP/nim"
+          echo "解压内容："; ls "$RUNNER_TEMP/nim"
+          # 兼容 zip 里带/不带顶层 node-nim 目录
+          if [ -d "$RUNNER_TEMP/nim/node-nim" ]; then echo "NODE_NIM_PATH=$RUNNER_TEMP/nim/node-nim" >> "$GITHUB_ENV";
+          else echo "NODE_NIM_PATH=$RUNNER_TEMP/nim" >> "$GITHUB_ENV"; fi
+          node -e "const p=require(process.env.NODE_NIM_PATH+'/package.json');console.log('node-nim 版本',p.version)" || echo "⚠️ 模块加载失败"
+
+      - name: 配 proxychains
+        env:
+          PX: ${{ secrets.SCRAPE_PROXY }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq proxychains4
+          node -e '
+            const u = new URL(process.env.PX.split(",")[0].trim());
+            const user = decodeURIComponent(u.username || "");
+            const pass = decodeURIComponent(u.password || "");
+            const lines = ["strict_chain", "proxy_dns", "tcp_read_time_out 20000", "tcp_connect_time_out 10000", "[ProxyList]"];
+            lines.push(`http ${u.hostname} ${u.port} ${user} ${pass}`);
+            process.stdout.write(lines.join("\n") + "\n");
+          ' > /tmp/proxychains4.conf
+          sudo cp /tmp/proxychains4.conf /etc/proxychains4.conf
+          echo "proxychains 已配置（不打印内容）"
+
+      - name: 经代理跑 node-nim
+        run: proxychains4 -q -f /etc/proxychains4.conf node probe-nodenim.mjs
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          USE_PROXY: '1'
+          NICK: ${{ inputs.nick }}
+          SEC: ${{ inputs.sec }}
+          NIM_PORT: '0'
