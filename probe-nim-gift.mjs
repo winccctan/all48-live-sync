@@ -111,7 +111,8 @@ const chatroom = NIMSDK.getInstance({
   account: accid,
   token: pwd,
   chatroomId: room.roomId,
-  chatroomAddresses: ['chatweblink01.netease.im:443'],
+  // 🔴 不硬编码 chatroomAddresses：写死 chatweblink01 时登录会报 13_2（非法操作或没有权限）。
+  //    交给 SDK 走 lbs.netease.im 自己解析当前可用节点。
   db: false,
   onconnect() { log('✅ NIM 已连上聊天室'); },
   onerror(e) { log('⚠️ NIM 错误：' + ((e && (e.message || e.code)) || e)); },
