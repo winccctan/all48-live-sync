@@ -1,19 +1,20 @@
 /**
- * 一次性探针：确认「成员房间消息接口」里到底有没有粉丝送礼消息（GIFT_TEXT）
+ * 一次性探针：确认「房间全量消息接口」能不能拿到粉丝送礼（GIFT_TEXT）
  *
- * 目的（2026-10-24 红蓝活动计分）：
- *   要统计「弦月回响」礼物，必须先证明三件事：
- *     ① 接口返回里含粉丝消息（channelRole=0），不只有房主（成员）发言；
- *     ② 粉丝送礼是 GIFT_TEXT，且 bodys 里有 giftName / giftNum；
- *     ③ 送的人（user_id / nickname）能拿到。
+ * 背景（2026-10-24 红蓝活动计分）：
+ *   我们一直在用的 `/im/api/v1/team/message/list/homeowner` **只回房主（成员本人）发言**
+ *   （已实测：6 人各 200 条 = 房主 200 / 粉丝 0 / GIFT_TEXT 0）。
+ *   但《口袋48鸡腿接口调研》记录还有一个 `/im/api/v1/team/message/list/all` = 所有人的房间消息。
+ *   这个探针就是去验它：能不能拿到 GIFT_TEXT、送礼人 ID、礼物名、数量。
  *
- * 只读、不上报。跑在 GitHub Actions（走国内代理），因为口袋48 对海外 IP 一律 403。
+ * 只读、不上报。必须跑在 GitHub Actions（走国内代理），口袋48 对海外 IP 一律 403。
  */
-import { fetchMessagePage } from './lib/api.mjs';
+import { postJson } from './lib/api.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const LIMIT = Number(process.env.PROBE_LIMIT || 100);
 
 if (!TOKEN) { console.error('缺少 POCKET48_TOKEN'); process.exit(1); }
 
@@ -22,59 +23,80 @@ const txt = await (await fetch(SITE + '/data/members.js', { headers: { 'User-Age
 const all = JSON.parse(txt.slice(txt.indexOf('['), txt.lastIndexOf(']') + 1));
 console.log('成员目录 ' + all.length + ' 人');
 
-// 2) 抽样：取「有房间(srv/ch)」的前若干人 + 指定 uid
+// 2) 抽样：在役（非荣誉毕业生）且房间信息齐全
 const pick = (process.env.PROBE_UIDS || '').split(',').map((s) => s.trim()).filter(Boolean).map(Number);
-let sample = all.filter((m) => m.srv && m.ch);
-if (pick.length) sample = sample.filter((m) => pick.includes(Number(m.id)));
-else sample = sample.slice(0, 6);
+let sample = all.filter((m) => m.srv && m.ch && m.tm && String(m.tm).indexOf('荣誉') < 0);
+if (pick.length) sample = all.filter((m) => pick.includes(Number(m.id)));
+else sample = sample.slice(0, 4);
 
-const LIMIT = Number(process.env.PROBE_LIMIT || 100);
-const giftNames = new Map();     // giftName -> 次数
-let totalMsgs = 0, fanMsgs = 0, giftMsgs = 0, ownerMsgs = 0;
-const giftSamples = [];
-const typeCount = new Map();
-
-for (const m of sample) {
+/** 试一个接口路径，返回 message 数组 */
+async function tryPath(path, m, token) {
   try {
-    const r = await fetchMessagePage({ serverId: m.srv, channelId: m.ch, nextTime: 0, limit: LIMIT, token: TOKEN });
-    const msgs = r.messages || [];
-    let fan = 0, gift = 0, owner = 0;
-    for (const x of msgs) {
-      totalMsgs++;
+    const data = await postJson(path, {
+      channelId: m.ch, serverId: m.srv, nextTime: 0, limit: LIMIT,
+    }, { token, retries: 1 });
+    const c = data && data.content;
+    const list = Array.isArray(c && c.message) ? c.message : [];
+    return { ok: true, list, next: c && c.nextTime, status: data && data.status, msg: data && data.msg };
+  } catch (e) {
+    return { ok: false, list: [], err: String((e && e.message) || e).slice(0, 160) };
+  }
+}
+
+const PATHS = [
+  '/im/api/v1/team/message/list/all',
+  '/im/api/v1/team/message/list/homeowner',
+];
+
+const giftNames = new Map();
+const giftSamples = [];
+let grand = { msgs: 0, fan: 0, gift: 0 };
+
+for (const path of PATHS) {
+  console.log('\n########## ' + path);
+  let total = 0, fan = 0, gift = 0;
+  for (const m of sample) {
+    const r = await tryPath(path, m, TOKEN);
+    if (!r.ok) { console.log(`  ${m.n} 失败：${r.err}`); continue; }
+    const types = new Map();
+    let g = 0, f = 0;
+    for (const x of r.list) {
       const t = String(x.msgType || 'TEXT');
-      typeCount.set(t, (typeCount.get(t) || 0) + 1);
+      types.set(t, (types.get(t) || 0) + 1);
       let ext = {};
       try { ext = typeof x.extInfo === 'string' ? JSON.parse(x.extInfo) : (x.extInfo || {}); } catch (e) { ext = {}; }
       const role = Number(ext.channelRole);
-      if (role === 2) owner++; else fan++;
+      if (role !== 2) f++;
       if (t === 'GIFT_TEXT') {
-        gift++;
+        g++;
         let ct = {};
         try { ct = typeof x.bodys === 'string' ? JSON.parse(x.bodys) : (x.bodys || {}); } catch (e) { ct = {}; }
-        const gi = ct.giftInfo || ct;
+        const gi = ct.giftInfo || {};
         const name = String(gi.giftName || '');
         giftNames.set(name, (giftNames.get(name) || 0) + 1);
-        if (giftSamples.length < 6) {
+        if (giftSamples.length < 8) {
           giftSamples.push({
-            member: m.n, uid: m.id,
+            member: m.n, memberId: m.id,
             senderId: (ext.user && ext.user.userId) || null,
             senderNick: (ext.user && (ext.user.nickname || ext.user.nickName)) || null,
-            role, msgTime: x.msgTime, bodys: String(x.bodys).slice(0, 260),
+            role, msgTime: x.msgTime,
+            giftName: name, giftNum: gi.giftNum, giftId: gi.giftId,
+            acceptUserName: gi.acceptUserName, userName: gi.userName,
           });
         }
       }
     }
-    ownerMsgs += owner; fanMsgs += fan; giftMsgs += gift;
-    console.log(`  ${m.n}(uid=${m.id}) 取回 ${msgs.length} 条 → 房主 ${owner} / 粉丝 ${fan} / 礼物 ${gift}`);
-  } catch (e) {
-    console.log(`  ${m.n}(uid=${m.id}) 失败：${String(e.message || e).slice(0, 120)}`);
+    total += r.list.length; fan += f; gift += g;
+    console.log(`  ${m.n}(uid=${m.id}) 取回 ${r.list.length} 条 → 粉丝/非房主 ${f} / 礼物 ${g} | nextTime=${r.next}`);
+    console.log(`     类型 ${JSON.stringify([...types.entries()].sort((a, b) => b[1] - a[1]))}`);
   }
+  console.log(`  —— 合计 ${total} 条：非房主 ${fan} / GIFT_TEXT ${gift}`);
+  grand = { msgs: grand.msgs + total, fan: grand.fan + fan, gift: grand.gift + gift };
 }
 
 console.log('\n===== 汇总 =====');
-console.log('样本消息 ' + totalMsgs + ' 条：房主 ' + ownerMsgs + ' / 粉丝 ' + fanMsgs + ' / GIFT_TEXT ' + giftMsgs);
-console.log('消息类型分布：' + JSON.stringify([...typeCount.entries()].sort((a, b) => b[1] - a[1])));
-console.log('礼物名 TOP：' + JSON.stringify([...giftNames.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15)));
-console.log('含「弦月回响」：' + [...giftNames.keys()].some((n) => n.indexOf('弦月') >= 0));
+console.log(`两个接口合计 ${grand.msgs} 条：非房主 ${grand.fan} / GIFT_TEXT ${grand.gift}`);
+console.log('礼物名 TOP：' + JSON.stringify([...giftNames.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)));
+console.log('含「弦月」的礼物：' + JSON.stringify([...giftNames.keys()].filter((n) => n.indexOf('弦月') >= 0)));
 console.log('\nGIFT_TEXT 样本：');
 for (const s of giftSamples) console.log('  ' + JSON.stringify(s));
