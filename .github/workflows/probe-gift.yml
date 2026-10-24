@@ -16,6 +16,9 @@ on:
       members:
         description: '自动抽样人数（uids 留空时生效）'
         default: '12'
+      pages:
+        description: '每人往回翻几页（一页 50 条）'
+        default: '4'
 
 permissions:
   contents: read
@@ -40,3 +43,4 @@ jobs:
           PROBE_UIDS: ${{ inputs.uids }}
           PROBE_LIMIT: ${{ inputs.limit }}
           PROBE_MEMBERS: ${{ inputs.members }}
+          PROBE_PAGES: ${{ inputs.pages }}

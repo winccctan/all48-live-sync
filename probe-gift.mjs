@@ -123,5 +123,8 @@ console.log(`两个接口合计 ${grand.msgs} 条：非房主 ${grand.fan} / GIF
 console.log('礼物名 TOP：' + JSON.stringify([...giftNames.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20)));
 console.log('含「弦月」的礼物：' + JSON.stringify([...giftNames.keys()].filter((n) => n.indexOf('弦月') >= 0)));
 console.log('(giftId|name) 全量：' + JSON.stringify([...giftPairs.entries()]));
+// 活动打分道具的特征：giftId 是 6 位且以 888 开头（正常礼物都是 18~19 位）
+const act = [...giftPairs.keys()].filter((k) => /^88\d{4}\|/.test(k));
+console.log('★ 6 位 888xxx 活动道具：' + JSON.stringify(act));
 console.log('\nGIFT_TEXT 样本：');
 for (const s of giftSamples) console.log('  ' + JSON.stringify(s));

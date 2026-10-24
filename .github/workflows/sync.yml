@@ -46,3 +46,33 @@ jobs:
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           FORCE_UIDS: ${{ inputs.force_uids }}
           MAX_MEMBERS: '600'
+
+  # 红蓝活动 · 礼物计分（弦月回响）
+  # 为什么塞在本工作流里而不是自己开一个：GitHub 的 schedule 触发器在这个仓库上不激活
+  # （实测 4 小时 0 次），靠的是站点 Worker 的 cron 去 workflow_dispatch 这个文件。
+  # 单独开一个 gift.yml 就只有 workflow_dispatch 能被拨到，一旦没人记得手动点就永远不跑。
+  # 放成独立 job（不是 sync 的一步）是为了并行：两个 job 各自一个 runner，
+  # 礼物扫描失败/变慢都不会拖累或打断直播与发言同步。
+  gift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 扫房间礼物并上报
+        run: node gift-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          GIFT_NAME: '弦月回响'
+          MAX_MEMBERS: '600'
+          CONC: '6'
+          GIFT_PAGES: '3'
