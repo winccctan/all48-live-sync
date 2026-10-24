@@ -1,76 +1,89 @@
 /**
- * 一次性探针：取官方礼物价目表，确认「弦月回响」是否存在、giftId 是多少
+ * 一次性探针：把礼品价目表整棵树挖干净，找出「弦月回响」的 giftId
  *
- * 为什么需要：GIFT_TEXT 里只有 giftName / giftId，没有价值。计分要按 giftId 精确过滤
- * （同一个礼物改名后名字会变，id 不变；活动打分道具也是 888xxx 的 id）。
+ * 前两次都栽在「猜层级」上：接口返回的 content 不是数组、也不是 {giftList:[]}，
+ * 而是 { "0": [...], "1": [...], "2": [...] } 这种分组套数组的结构。
+ * 这次不再猜 —— 递归遍历整棵 JSON，凡是对象里带 giftName / name 的节点都算礼物，全捞出来。
  *
- * content 结构（实测）：{ "0": {typeId,typeName,specialInstru,giftList:[...]}, "1": {...}, "2": {...} }
- * 礼物在每组的 giftList 里，不在组顶层。
+ * 拿到 giftId 之后填进 worker 的 GIFT_IDS：活动礼物会改名，id 不会；
+ * 而且 888xxx 那批是「活动打分道具」，用完就下架、下次活动换名字，必须靠 id 分辨。
  */
 import { postJson } from './lib/api.mjs';
 
 const TOKEN = process.env.POCKET48_TOKEN || '';
 if (!TOKEN) { console.error('缺少 POCKET48_TOKEN'); process.exit(1); }
 
-/** 把 content（可能是对象分组 / 数组 / 直接带 giftList）拍平成一维礼物数组 */
-function flatten(content) {
-  const out = [];
-  const pushList = (arr, tag) => {
-    if (!Array.isArray(arr)) return;
-    for (const g of arr) if (g && typeof g === 'object') out.push({ ...g, __group: tag });
-  };
-  if (!content) return out;
-  if (Array.isArray(content)) { pushList(content, 'root'); return out; }
-  if (typeof content !== 'object') return out;
-  if (Array.isArray(content.giftList)) { pushList(content.giftList, content.typeName || 'root'); return out; }
-  for (const k of Object.keys(content)) {
-    const grp = content[k];
-    if (!grp || typeof grp !== 'object') continue;
-    const tag = grp.typeName != null ? grp.typeName : k;
-    if (Array.isArray(grp.giftList)) pushList(grp.giftList, tag);
-    else if (Array.isArray(grp)) pushList(grp, tag);
+/** 递归收集所有「看起来像礼物」的节点 */
+function collect(node, out, path, depth) {
+  if (depth > 8 || node == null) return;
+  if (Array.isArray(node)) {
+    node.forEach((v, i) => collect(v, out, path + '[' + i + ']', depth + 1));
+    return;
   }
-  return out;
+  if (typeof node !== 'object') return;
+
+  const name = node.giftName || node.name || node.gift_name;
+  const id = node.giftId || node.id || node.gift_id;
+  if (name != null && id != null && String(name).length && String(id).length) {
+    out.push({
+      path,
+      id: String(id),
+      name: String(name),
+      keys: Object.keys(node),
+      node,
+    });
+  }
+  for (const k of Object.keys(node)) {
+    if (k === 'giftName' || k === 'name') continue;
+    collect(node[k], out, path + '.' + k, depth + 1);
+  }
 }
 
-const bodies = [{}, { giftType: 1 }, { businessId: 0, giftType: 1 }];
+const seenPath = new Set();
 
-for (const b of bodies) {
-  console.log('\n===== /gift/api/v1/gift/list  body=' + JSON.stringify(b));
+async function dump(label, body) {
+  console.log('\n===== /gift/api/v1/gift/list  body=' + JSON.stringify(body));
+  let d = null;
   try {
-    const d = await postJson('/gift/api/v1/gift/list', b, { token: TOKEN, retries: 1 });
-    const c = (d && d.content) || {};
-    const list = flatten(c);
-    console.log('status=' + (d && d.status) + ' msg=' + (d && d.msg));
-    console.log('分组 keys=' + JSON.stringify(Object.keys(c || {})).slice(0, 200) + ' → 拍平后礼物数 ' + list.length);
-    if (!list.length) continue;
-
-    const fields = new Set();
-    for (const g of list) for (const k of Object.keys(g)) fields.add(k);
-    console.log('全字段 ' + JSON.stringify([...fields]));
-
-    const nameOf = (g) => String(g.giftName || g.name || '');
-    const idOf = (g) => g.giftId || g.id || '';
-
-    // 1) 精确找「弦月回响」
-    const hit = list.filter((g) => nameOf(g).indexOf('弦月') >= 0 || nameOf(g).indexOf('回响') >= 0);
-    if (hit.length) {
-      for (const g of hit) {
-        console.log('  ★ 命中 ' + JSON.stringify({ giftId: idOf(g), giftName: nameOf(g), group: g.__group, money: g.money, price: g.price, charm: g.charm, giftType: g.giftType }));
-      }
-    } else {
-      console.log('  ✗ 没有名字含「弦月」或「回响」的礼物');
-    }
-
-    console.log('  分组清单：');
-    const byGroup = new Map();
-    for (const g of list) {
-      const k = g.__group || '?';
-      if (!byGroup.has(k)) byGroup.set(k, []);
-      byGroup.get(k).push(nameOf(g));
-    }
-    for (const [k, arr] of byGroup) console.log('    [' + k + '] ' + arr.length + ' 个：' + arr.join(' / ').slice(0, 600));
+    d = await postJson('/gift/api/v1/gift/list', body, { token: TOKEN, retries: 1 });
   } catch (e) {
-    console.log('  失败 ' + String((e && e.message) || e).slice(0, 160));
+    console.log('  失败 ' + String((e && e.message) || e).slice(0, 200));
+    return;
   }
+  console.log('  status=' + (d && d.status) + ' msg=' + (d && d.msg));
+  const out = [];
+  collect(d && d.content, out, 'content', 0);
+  console.log('  递归挖出礼物节点 ' + out.length + ' 个');
+
+  const uniq = new Map();
+  for (const g of out) uniq.set(g.id + '|' + g.name, g);
+  const list = [...uniq.values()];
+  if (list.length) {
+    console.log('  节点字段样例 ' + JSON.stringify(list[0].keys));
+    console.log('  路径样例 ' + list[0].path);
+  }
+
+  const hit = list.filter((g) => /弦月|回响|弦/.test(g.name));
+  if (hit.length) {
+    for (const g of hit) {
+      console.log('  ★★★ 命中 ' + JSON.stringify({ id: g.id, name: g.name, path: g.path, node: g.node }));
+    }
+  } else {
+    console.log('  ✗ 没有含「弦月 / 回响 / 弦」的礼物');
+  }
+
+  const names = list.map((g) => g.name + '(' + g.id + ')');
+  console.log('  全部 ' + names.length + ' 个：');
+  for (let i = 0; i < names.length; i += 6) console.log('    ' + names.slice(i, i + 6).join('  '));
+  seenPath.add(label);
 }
+
+await dump('{}', {});
+await dump('giftType1', { giftType: 1 });
+
+// 顺手把原始 JSON 头 800 字符打出来，下次再猜层级就有依据了
+try {
+  const d = await postJson('/gift/api/v1/gift/list', {}, { token: TOKEN, retries: 1 });
+  console.log('\n===== 原始 content 头 1200 字符 =====');
+  console.log(JSON.stringify(d && d.content).slice(0, 1200));
+} catch (e) { /* ignore */ }

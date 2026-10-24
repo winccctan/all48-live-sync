@@ -15,6 +15,7 @@ const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const LIMIT = Number(process.env.PROBE_LIMIT || 100);
+const PAGES = Math.max(1, Number(process.env.PROBE_PAGES || 4));
 
 if (!TOKEN) { console.error('缺少 POCKET48_TOKEN'); process.exit(1); }
 
@@ -42,9 +43,30 @@ async function tryPath(path, m, token) {
   }
 }
 
+/** 🔴 该接口单页上限实测 50 条（传 150 也只给 50），要往回翻只能带 nextTime 翻页 */
+async function fetchPages(path, m, token, pages) {
+  const all = [];
+  let next = 0;
+  for (let i = 0; i < pages; i++) {
+    let data = null;
+    try {
+      data = await postJson(path, { channelId: m.ch, serverId: m.srv, nextTime: next, limit: LIMIT }, { token, retries: 1 });
+    } catch (e) {
+      return { ok: false, list: all, err: String((e && e.message) || e).slice(0, 160) };
+    }
+    const c = (data && data.content) || {};
+    const list = Array.isArray(c.message) ? c.message : [];
+    all.push(...list);
+    const nx = c.nextTime;
+    if (!list.length || !nx || String(nx) === '0' || String(nx) === String(next)) break;
+    next = nx;
+  }
+  return { ok: true, list: all, next };
+}
+
 const PATHS = [
+  // 🔴 homeowner 已实测拿不到粉丝送礼（200 条 → 非房主 0 / 礼物 0），这轮只探 list/all
   '/im/api/v1/team/message/list/all',
-  '/im/api/v1/team/message/list/homeowner',
 ];
 
 const giftNames = new Map();
@@ -56,7 +78,7 @@ for (const path of PATHS) {
   console.log('\n########## ' + path);
   let total = 0, fan = 0, gift = 0;
   for (const m of sample) {
-    const r = await tryPath(path, m, TOKEN);
+    const r = await fetchPages(path, m, TOKEN, PAGES);
     if (!r.ok) { console.log(`  ${m.n} 失败：${r.err}`); continue; }
     const types = new Map();
     let g = 0, f = 0;
