@@ -76,3 +76,28 @@ jobs:
           MAX_MEMBERS: '600'
           CONC: '6'
           GIFT_PAGES: '3'
+
+  # 红蓝活动 · 直播间礼物
+  # 直播间送礼**不进房间 IM**，只在每场直播结束后的弹幕 LRC 里（getLiveOne → msgFilePath）。
+  # 所以这个 job 天然滞后到「这场播完」，不像房间侧那样准实时。
+  # 独立 job：单场 LRC 可能有几万行，慢一点也不会影响另外两个 job。
+  livegift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 扫直播弹幕礼物并上报
+        run: node live-gift-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          LG_MAX: '25'
