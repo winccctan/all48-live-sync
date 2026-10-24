@@ -470,6 +470,7 @@ async function main() {
     let idx = 0;
     const allAdd = [];
     const report = [];
+    const pendingCache = [];   // 本轮判出缺口的人：等 ingest 回来才知道到底进没进库
 
     async function run() {
       for (;;) {
@@ -481,15 +482,22 @@ async function main() {
         if (!uid) continue;
         // 🔴 省请求的两道闸（xox48 会被打限流，全员明细一轮 250+ 次请求是打不动的）：
         //   ① 我们的份数已经追平它报的分数 ⇒ 根本没缺口，连明细都不用拉；
-        //   ② 最近 10 分钟内拉过、且它的分数没变 ⇒ 那次已经补过，不用再问。
+        //   ② 最近拉过、它的分数没变、而且**上一轮确实补进去了** ⇒ 不用再问。
         //   这样无直播的静默期整轮只剩 2 个请求（rank + liveall）。
+        //
+        //   🔴 ② 必须区分「补进去了」和「拉过但没补上」（2026-10-25 康楚翊差 1 分查到的）：
+        //      原来只看「10 分钟内拉过 + 分数没变」就跳过，可上一轮判出缺 1 条、
+        //      补的那条在 worker 侧被模糊去重吞掉了（间隔正好 15 秒撞窗口），
+        //      结果接下来 10 分钟一直跳过、永远补不上 —— 站里 282，xox 283，差 1 分卡死。
+        //      现在只有「上一轮 added>0」才给 10 分钟冷却，否则 60 秒后立刻重试。
         const mine0 = mineIndex.get(uid) || [];
         const mineSum0 = mine0.reduce((a, b) => a + b.num, 0);
         const target = Number(x[field]) || 0;
         if (mineSum0 >= target) continue;
         const ck = uid + (src === 1 ? ':l' : ':r');
         const c0 = cache[ck];
-        if (!FORCE && c0 && Number(c0.vote) === target && Date.now() - Number(c0.at || 0) < 10 * 60000) continue;
+        const cool = c0 && Number(c0.added) > 0 ? 10 * 60000 : 60000;
+        if (!FORCE && c0 && Number(c0.vote) === target && Date.now() - Number(c0.at || 0) < cool) continue;
         try {
           const theirs = await xoxRows(uid, src);
           if (!theirs.length) continue;
@@ -500,6 +508,7 @@ async function main() {
           const sumO = mine.reduce((a, b) => a + b.num, 0);
           const sumM = forgot.reduce((a, b) => a + b.num, 0);
           const sumU = oursOnly.reduce((a, b) => a + b.num, 0);
+          let addedHere = 0;
           if (sumM > 0 || sumU > 0) {
             report.push({
               nick, uid, sumX, sumO, sumM, sumU,
@@ -511,8 +520,11 @@ async function main() {
             }
             if (sumM > 0) log(`  ${nick}: xox ${sumX} · 我们 ${sumO} · 补 ${sumM}（${forgot.length} 条）${sumU ? ` · 我们独有 ${sumU}` : ''}`);
           }
-          // 拉成功了才记缓存：失败的要留到下一轮重试，否则那一段的分就永久漏了
-          cache[ck] = { vote: target, at: Date.now(), sum: sumX };
+          // 拉成功了才记缓存：失败的要留到下一轮重试，否则那一段的分就永久漏了。
+          // 无缺口的人直接记 10 分钟冷却（反正 ① 也挡）；有缺口的人先记「待验证」，
+          // 等 ingest 回来按实际入库数补正（见下面 added 回写）。
+          cache[ck] = { vote: target, at: Date.now(), sum: sumX, added: sumM > 0 ? 0 : 1 };
+          pendingCache.push(ck);
         } catch (e) {
           log(`  [${nick}] 失败：${String(e.message).slice(0, 90)}`);
         }
@@ -548,6 +560,12 @@ async function main() {
       const { added } = await ingest(allAdd);
       grandAddedTotal += added;
       log(`实际入库 ${added} 条`);
+      // 🔴 只有「说要补的」全都进库了，才给这些人 10 分钟冷却；
+      //    否则说明补的条目在 worker 侧被挡（去重/过滤），1 分钟后就重试，
+      //    绝不出现「拉过就当补过、缺口一直挂着」的假追平。
+      const allIn = added >= allAdd.length;
+      for (const ck of pendingCache) if (cache[ck]) cache[ck].added = allIn ? 1 : 0;
+      if (!allIn) log(`  ⚠ 有 ${allAdd.length - added} 条没进库，1 分钟后重试`);
     }
     if (REPORT_FILE) {
       try {
