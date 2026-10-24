@@ -345,10 +345,6 @@ async function fetchOfficialIndex() {
 
 const fuzzNick = (s) => String(s || '').replace(/\s+/g, '').toLowerCase();
 
-/** 特殊身份（毕业/殿堂/影视/团魂）不参与任何自动写入，与 worker 的 ROSTER_KEEP_* 同口径 */
-const KEEP_G = new Set(['明星殿堂', '丝芭影视', '燃烧吧团魂', 'IDFT']);
-const KEEP_TM = new Set(['荣誉毕业生']);
-
 /**
  * 名册校准：**只补人，不改人**。
  *
