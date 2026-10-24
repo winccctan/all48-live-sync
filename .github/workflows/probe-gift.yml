@@ -1,0 +1,36 @@
+# 一次性探针：确认房间消息接口里有没有粉丝送礼（GIFT_TEXT）
+#
+# 只读，不上报，不写站点。用于「红蓝活动 · 弦月回响计分」开发前的数据验证。
+# 必须跑在 GitHub Actions（配国内代理 SCRAPE_PROXY），因为口袋48 对海外 IP 一律 403。
+name: 探针 · 礼物字段
+
+on:
+  workflow_dispatch:
+    inputs:
+      uids:
+        description: '只探这几个 uid（逗号分隔，留空=自动抽样 6 人）'
+        default: ''
+      limit:
+        description: '每人取多少条消息'
+        default: '100'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 探测
+        run: node probe-gift.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          PROBE_UIDS: ${{ inputs.uids }}
+          PROBE_LIMIT: ${{ inputs.limit }}
