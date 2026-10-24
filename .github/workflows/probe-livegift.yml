@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: '22'
       - name: 探测
-        run: node probe-livegift2.mjs
+        run: node probe-livegift3.mjs
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
