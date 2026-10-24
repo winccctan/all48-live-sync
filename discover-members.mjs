@@ -110,7 +110,25 @@ for (let p = 0; p < PAGES; p++) {
   next = r.next;
 }
 log(`翻 ${pages} 页 / ${seen} 条直播记录 · 名册外的主播 ${strangers.size} 人（耗时 ${((Date.now() - t0) / 1000).toFixed(0)}s）`);
-if (!strangers.size) { log('没有新人，收工'); process.exit(0); }
+
+/* ---------------------------------------------- ②b 名册里有、但没有房间的人
+   典型来源：xox48 对账只补了名字（它只有 uid → 名字/团/队，没有房间号），
+   于是人上了榜但抓取端扫不到她的房间 —— 表现为「榜上有名字、点进去啥也没有」。
+   这些人一旦开播过、或本来就该有房间，jump 一次就能拿到 serverId/channelId。
+   每轮最多补 12 个（低频、量小，不会给口袋48 加压）。 */
+const KEEP_TM = new Set(['荣誉毕业生']);
+const KEEP_G = new Set(['明星殿堂', '丝芭影视', '燃烧吧团魂']);
+const noRoom = [];
+for (const m of roster.values()) {
+  if (!m || !m.id || (m.srv && m.ch)) continue;
+  if (KEEP_TM.has(String(m.tm || '')) || KEEP_G.has(String(m.g || ''))) continue;
+  if (!m.n) continue;
+  noRoom.push({ uid: Number(m.id), name: String(m.n), nick: '', last: 0, g: m.g || '', tm: m.tm || '', isNew: false });
+}
+if (noRoom.length) log(`名册内「无房间」${noRoom.length} 人（本轮最多补 ${Math.min(12, noRoom.length)} 个）`);
+const EMPTY_MAX = 12;
+
+if (!strangers.size && !noRoom.length) { log('新人 0 · 无房间 0，收工'); process.exit(0); }
 
 /* ---------------------------------------------- ③ 官方全团表（团/队权威源） */
 let official = null;
@@ -135,16 +153,20 @@ try {
 if (!TOKEN && !DRY) { log('缺少 POCKET48_TOKEN，无法核对房间；名册仍会补上名字（房间为 0）'); }
 const todo = [];
 let i = 0;
-const arr = [...strangers.entries()];
+const arr = [
+  ...[...strangers.entries()].map(([uid, info]) => ({ uid, ...info, isNew: true })),
+  ...noRoom.slice(0, EMPTY_MAX),
+];
 async function worker() {
   for (;;) {
     const idx = i++;
     if (idx >= arr.length) return;
-    const [uid, info] = arr[idx];
+    const t = arr[idx];
+    const info = t;
     let srv = 0, ch = 0;
     if (TOKEN) {
       try {
-        const j = await postJson('/im/api/v1/im/server/jump', { tabId: 0, targetType: 1, starId: uid }, { token: TOKEN, retries: 2 });
+        const j = await postJson('/im/api/v1/im/server/jump', { tabId: 0, targetType: 1, starId: t.uid }, { token: TOKEN, retries: 2 });
         const c = j.content || {};
         srv = Number(c.serverId) || 0;
         ch = Number(c.channelId) || 0;
@@ -152,19 +174,24 @@ async function worker() {
         log(`  ${info.name} jump 失败：${String(e.message).slice(0, 60)}`);
       }
     }
-    let g = '', tm = '';
-    const hit = official && official.get(fuzzNick(info.name));
-    if (hit && hit.length === 1) {
-      g = GROUP_MAP[String(hit[0].gname || '').trim().toUpperCase()] || '';
-      tm = mapTeam(hit[0].gname, hit[0].tname);
+    // 已有成员只补房间，团/队一个字都不动（站长：「我们是对的」）
+    let g = t.g || '', tm = t.tm || '';
+    if (t.isNew) {
+      const hit = official && official.get(fuzzNick(info.name));
+      if (hit && hit.length === 1) {
+        g = GROUP_MAP[String(hit[0].gname || '').trim().toUpperCase()] || '';
+        tm = mapTeam(hit[0].gname, hit[0].tname);
+      }
+      // 官方表没收录 → 团从昵称前缀猜（BEJ48-xx），队留空
+      if (!g) {
+        const m = /^([A-Z]+48)-/.exec(String(info.nick || ''));
+        if (m) g = GROUP_MAP[m[1].slice(0, 3)] || m[1];
+      }
     }
-    // 官方表没收录 → 团从昵称前缀猜（BEJ48-xx），队留空
-    if (!g) {
-      const m = /^([A-Z]+48)-/.exec(String(info.nick || ''));
-      if (m) g = GROUP_MAP[m[1].slice(0, 3)] || m[1];
-    }
-    todo.push([uid, info.name, g, tm, null, srv, ch]);
-    log(`  + ${info.name}  uid=${uid}  ${g}/${tm || '（队未知）'}  srv=${srv} ch=${ch}  最后播 ${new Date(info.last + BJ).toISOString().slice(0, 16).replace('T', ' ')}`);
+    const tag = t.isNew ? '+' : '⟳';
+    const when = info.last ? '  最后播 ' + new Date(info.last + BJ).toISOString().slice(0, 16).replace('T', ' ') : '';
+    todo.push([t.uid, info.name, g, tm, null, srv, ch]);
+    log(`  ${tag} ${info.name}  uid=${t.uid}  ${g}/${tm || '（队未知）'}  srv=${srv} ch=${ch}${when}`);
   }
 }
 await Promise.all(Array.from({ length: Math.min(4, arr.length) }, worker));
