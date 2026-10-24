@@ -1,7 +1,6 @@
-# 一次性探针：看 SCRAPE_PROXY 各个代理的出口 IP 落在哪里
+# 一次性探针：看 SCRAPE_PROXY 每个代理「能不能用 + 是不是国内出口」
 #
-# 🔴 仓库是 public，日志公开可见 —— **绝对不要打印代理地址/账号密码**，
-#    这里只输出出口 IP，用来判断「是不是国内出口」。
+# 🔴 仓库是 public，日志公开可见 —— 绝不打印代理地址/账号密码，只输出结果码和出口 IP。
 name: 探针 · 代理出口
 
 on:
@@ -13,13 +12,13 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: Runner 直连出口
+      - name: Runner 直连
         run: |
-          echo "runner 直连 = $(curl -s --max-time 15 https://api.ipify.org || echo FAIL)"
+          echo "runner 直连 ip = $(curl -s --max-time 15 https://api.ipify.org || echo FAIL)"
 
-      - name: 各代理出口
+      - name: 逐个代理实测
         env:
           PX: ${{ secrets.SCRAPE_PROXY }}
         run: |
@@ -29,6 +28,15 @@ jobs:
             p=$(printf '%s' "$p" | tr -d '[:space:]')
             [ -z "$p" ] && continue
             n=$((n + 1))
-            ip=$(curl -s --max-time 25 -x "$p" https://api.ipify.org 2>/dev/null || echo FAIL)
-            echo "代理 #$n 出口 = $ip"
+            # ① 出口 IP（ipify 走代理不通就用 ipinfo 兜底）
+            ip=$(curl -s --max-time 20 -x "$p" https://api.ipify.org 2>/dev/null | tr -d '\r')
+            [ -z "$ip" ] && ip=$(curl -s --max-time 20 -x "$p" https://ipinfo.io/ip 2>/dev/null | tr -d '\r')
+            [ -z "$ip" ] && ip="FAIL"
+            # ② 访问国内站点（证明代理真的通外网）
+            baidu=$(curl -s --max-time 20 -x "$p" -o /dev/null -w '%{http_code}' https://www.baidu.com 2>/dev/null || echo ERR)
+            # ③ 访问口袋48 接口（真实用途）
+            p48=$(curl -s --max-time 25 -x "$p" -o /dev/null -w '%{http_code}' \
+                   -X POST https://pocketapi.48.cn/live/api/v1/live/getLiveList \
+                   -H 'Content-Type: application/json' -d '{}' 2>/dev/null || echo ERR)
+            echo "代理 #$n → 出口=$ip 百度=$baidu 口袋48=$p48"
           done
