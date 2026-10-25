@@ -85,7 +85,7 @@ function log(...a) {
 
 // ---------------------------------------------------------------- 任务表
 // every: 两次之间至少隔多久；timeout: 单次最长跑多久（超时杀掉，绝不堆积）
-const TASKS = [
+const ALL_TASKS = [
   { id: 'room', script: 'gift-sync.mjs', every: 120e3, timeout: 300e3,
     env: { CONC: '8', GIFT_PAGES: '2', MAX_MEMBERS: '600' } },       // 房间礼物（红蓝榜主源）
   { id: 'live', script: 'backfill-live-gift.mjs', every: 90e3, timeout: 240e3 },  // 已结束直播的回放补抓
@@ -93,6 +93,10 @@ const TASKS = [
   { id: 'perf', script: 'perf-gift-sync.mjs', every: 180e3, timeout: 300e3 },     // 公演礼物
   { id: 'perfhot', script: 'perf-hot-sync.mjs', every: 300e3, timeout: 300e3 },   // 公演官方对账
 ];
+// TASKS=room,live 可以只跑指定通道（自检 / 排障用；不传 = 全部）
+const TASKS = process.env.TASKS
+  ? ALL_TASKS.filter((t) => String(process.env.TASKS).split(',').map((s) => s.trim()).includes(t.id))
+  : ALL_TASKS;
 const state = Object.fromEntries(TASKS.map((t) => [t.id, { at: 0, child: null, killedFor: 0 }]));
 
 function runTask(t) {
@@ -201,7 +205,7 @@ async function tick() {
   }
 
   log(`接手：数据已 ${p.gift ? p.gift.ageSec : '?'}s 未更新`);
-  sseStart();
+  if (process.env.NO_SSE !== '1') sseStart();
   const now = Date.now();
   for (const t of TASKS) {
     const st = state[t.id];

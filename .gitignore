@@ -8,3 +8,10 @@ nim-sync.pid
 
 # xox48 对账补差的本地缓存（每成员上次拉到的 live_vote）
 .xox-cache.json
+
+# 备用跑者（2026-10-26）：凭据 + 运行期文件，绝不进 git
+fb.env
+fb-runner.log
+fb-runner.log.1
+.fb-runner.pid
+.sse-state-*.json
