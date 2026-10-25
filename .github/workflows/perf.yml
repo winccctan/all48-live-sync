@@ -1,0 +1,46 @@
+# 公演榜 · 公演直播间礼物采集
+#
+# 为什么单独一条：
+#   公演直播间的礼物不进成员房间 IM，口袋48 的公演聊天室拿不到 srv/ch，
+#   回放也只有视频没有弹幕 ⇒ **只有开演时盯弹幕流才能记录**，错过就没有。
+#   所以这条工作流是「贴着公演时间跑的长任务」：每 10 分钟拨一次，
+#   每轮最长 55 分钟；没有公演在播时 20 秒内退出（几乎不花额度，仓库是 public）。
+#
+# 口径：礼物名/数量/收礼人/单价全部由我们自己按价目表算，不读任何第三方算好的榜。
+# 落库：POST {SITE_URL}/api/lv/all（room=3）+ POST {SITE_URL}/api/perf/sessions（场次）
+name: 公演榜 · 直播礼物采集
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: '本轮跑多少分钟'
+        default: '55'
+  schedule:
+    # 每 10 分钟一次；公演一般 13:45 / 19:15 开演，长任务自然覆盖整场
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-gift
+  cancel-in-progress: false
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 盯公演弹幕 + 推场次
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          RUN_MINUTES: ${{ inputs.run_minutes || '55' }}
+        run: node perf-gift-sync.mjs
