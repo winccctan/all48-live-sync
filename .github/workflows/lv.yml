@@ -47,7 +47,7 @@ jobs:
     name: 房间侧全礼物
     if: ${{ (inputs.only || 'all') != 'live' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -78,7 +78,7 @@ jobs:
     name: 直播侧回放弹幕（全礼物）
     if: ${{ (inputs.only || 'all') != 'room' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

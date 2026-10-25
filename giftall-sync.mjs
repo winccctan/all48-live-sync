@@ -51,6 +51,43 @@ const unknown = {};    // 查不到价的礼物名
 let ok = 0, empty = 0, err = 0, pages = 0;
 let cur = 0;
 
+/* 🔴 边扫边报（2026-10-25 补 10-24 全天数据时改的）：
+   原来只在最后一次性 POST，深度回填（PAGES 几十页 × 500 房间）一跑就超过 job 的
+   timeout ⇒ runner 被杀 ⇒ **一条都没上报**，白跑 20 分钟。
+   现在攒到 1500 条或每 15 秒就推一批，被超时截断也留下已完成的部分。 */
+const pend = [];
+const INGEST = process.env.INGEST_TOKEN || '';
+const PUSH_ON = process.env.PUSH !== '0' && !!INGEST;
+let flushed = 0, flushBusy = false;
+
+async function flushPend(final) {
+  if (!PUSH_ON || flushBusy) return;
+  flushBusy = true;
+  try {
+    while (pend.length) {
+      const part = pend.splice(0, 2000);
+      try {
+        const res = await fetch(SITE + '/api/lv/all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+          body: JSON.stringify({ ch: 'room', items: part }),
+        });
+        const out = await res.json().catch(() => ({}));
+        if (!res.ok || out.ok === false) throw new Error('HTTP ' + res.status + ' ' + JSON.stringify(out).slice(0, 120));
+        flushed += part.length;
+        if (final) log(`上报 ${flushed} 条 · ${JSON.stringify(out.days || out).slice(0, 140)}`);
+      } catch (e) {
+        pend.unshift(...part);            // 没成功就退回去，下一轮再试
+        if (final) log('上报失败：' + String(e.message).slice(0, 120));
+        break;
+      }
+    }
+  } finally {
+    flushBusy = false;
+  }
+}
+const flushTimer = PUSH_ON ? setInterval(() => { flushPend(false); }, 15000) : null;
+
 async function worker() {
   for (;;) {
     const i = cur++;
@@ -58,6 +95,7 @@ async function worker() {
     const m = byId.get(uids[i]);
     let next = 0;
     let got = 0;
+    const before = items.length;
     try {
       for (let p = 0; p < PAGES; p++) {
         const r = await fetchMessagePage({ serverId: m.srv, channelId: m.ch, nextTime: next, limit: LIMIT, token: TOKEN, scope: 'all' });
@@ -102,7 +140,12 @@ async function worker() {
       err++;
       if (err <= 8) log(`  ${m.n || uids[i]} 失败 ${String(e.message).slice(0, 70)}`);
     }
-    if ((ok + empty + err) % 60 === 0) log(`进度 ${ok + empty + err}/${uids.length}`);
+    // 这一房的新数据立刻进上报队列（见 flushPend 的注释）
+    if (PUSH_ON && items.length > before) {
+      pend.push(...items.slice(before));
+      if (pend.length >= 1500) flushPend(false);
+    }
+    if ((ok + empty + err) % 60 === 0) log(`进度 ${ok + empty + err}/${uids.length} · 已上报 ${flushed}`);
   }
 }
 
@@ -122,29 +165,12 @@ try {
   log('本地落盘失败（不影响上报）：' + String(e.message).slice(0, 120));
 }
 
-/* 顺手推一份到站点 R2（lv:all:YYYYMMDD）：本地 demo 直接从 /api/lv/all 取数，
-   省掉「Actions 产物还得手动下载」那一步。PUSH=0 可以跳过。 */
-if (process.env.PUSH !== '0' && items.length) {
-  const INGEST = process.env.INGEST_TOKEN || '';
-  if (!INGEST) {
-    log('跳过上报：没有 INGEST_TOKEN');
-  } else {
-    let pushed = 0;
-    for (let i = 0; i < items.length; i += 2000) {
-      const part = items.slice(i, i + 2000);
-      try {
-        const res = await fetch(SITE + '/api/lv/all', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
-          body: JSON.stringify({ ch: 'room', items: part }),
-        });
-        const out = await res.json().catch(() => ({}));
-        pushed += part.length;
-        log(`上报 ${part.length} 条 → ${JSON.stringify(out.days || out).slice(0, 160)}`);
-      } catch (e) {
-        log('上报失败：' + String(e.message).slice(0, 120));
-      }
-    }
-    log(`共上报 ${pushed} 条`);
+/* 收尾：剩的全推上去（PUSH=0 可以跳过） */
+if (flushTimer) clearInterval(flushTimer);
+if (PUSH_ON) {
+  if (!INGEST) log('跳过上报：没有 INGEST_TOKEN');
+  else {
+    await flushPend(true);
+    log(`共上报 ${flushed} 条`);
   }
 }
