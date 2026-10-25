@@ -53,13 +53,19 @@ jobs:
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
-          PAGES: ${{ inputs.pages || '3' }}
+          PAGES: ${{ inputs.pages || '4' }}
           CONC: ${{ inputs.conc || '6' }}
           SINCE_INPUT: ${{ inputs.since }}
+          OUT: ${{ runner.temp }}/giftall.json
         run: |
-          if [ -n "$SINCE_INPUT" ]; then
-            export SINCE=$(node -e "console.log(Date.parse('${SINCE_INPUT}T00:00:00+08:00'))")
-          fi
+          # 默认从「北京昨天 00:00」起算（活动跨天，只算今天会只剩半截）
+          export SINCE=$(node -e "
+            const BJ=8*3600e3, d=new Date(Date.now()+BJ);
+            const today=Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate())-BJ;
+            const inp=process.env.SINCE_INPUT||'';
+            console.log(inp ? Date.parse(inp+'T00:00:00+08:00') : today-86400e3);
+          ")
+          echo "SINCE=$SINCE"
           node giftall-sync.mjs
 
   live:

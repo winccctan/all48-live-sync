@@ -114,8 +114,13 @@ const totalNum = items.reduce((a, b) => a + b.num, 0);
 log(`鸡腿合计 ${totalValue} · 礼物件数 ${totalNum} · 未知价礼物 ${JSON.stringify(unknown)}`);
 log('礼物分布：' + JSON.stringify(Object.entries(stats).sort((a, b) => b[1] - a[1]).slice(0, 20)));
 
-writeFileSync(OUT, JSON.stringify({ at: Date.now(), since: SINCE, items }, null, 0));
-log('写到 ' + OUT);
+try {
+  writeFileSync(OUT, JSON.stringify({ at: Date.now(), since: SINCE, items }, null, 0));
+  log('写到 ' + OUT);
+} catch (e) {
+  // GitHub runner 上没有本地那个 output 目录 —— 写不进去不该让整条上报失败
+  log('本地落盘失败（不影响上报）：' + String(e.message).slice(0, 120));
+}
 
 /* 顺手推一份到站点 R2（lv:all:YYYYMMDD）：本地 demo 直接从 /api/lv/all 取数，
    省掉「Actions 产物还得手动下载」那一步。PUSH=0 可以跳过。 */
