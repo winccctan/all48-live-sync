@@ -34,6 +34,23 @@ const memberMap = new Map();
 const senderMap = new Map();
 const giftMap = new Map();
 
+/* 🔴 直播侧（回放弹幕）只有昵称、没有 uid ⇒ 先用房间侧记录建「昵称 → sid」索引，
+   否则所有直播间送礼人会全挤成一个 sid=0 的「匿名」大户。 */
+const nickIdx = new Map();
+for (const r of items) {
+  const sid = Number(r.sid) || 0;
+  const sn = String(r.sn || '').trim();
+  if (!sid || !sn) continue;
+  let mm2 = nickIdx.get(sn);
+  if (!mm2) { mm2 = new Map(); nickIdx.set(sn, mm2); }
+  mm2.set(sid, (mm2.get(sid) || 0) + 1);
+}
+function nickUid(sn) {
+  const mm2 = nickIdx.get(String(sn || '').trim());
+  if (!mm2 || !mm2.size) return 0;
+  return [...mm2.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0][0];
+}
+
 for (const r of items) {
   // 🔴 单价一律按现行价目表重算，忽略 JSON 里存的历史 val/v ——
   //    这样改价（例如「弹幕不计鸡腿」）只要重建 demo 就生效，不必重跑抓取。
@@ -41,11 +58,14 @@ for (const r of items) {
   const num = Number(r.num) || 0;
   const val = price * num;
   const mm = mem.get(Number(r.mid)) || {};
+  const sid = Number(r.sid) || nickUid(r.sn);
+  const skey = sid ? String(sid) : ('n:' + String(r.sn || ''));
 
   let m = memberMap.get(r.mid);
   if (!m) {
     m = {
-      id: r.mid, n: r.mn || String(r.mid), g: mm.g || '其他', t: mm.tm || '',
+      // 名字三处兜底：记录自带 mn（房间直抓）→ 成员目录 → 实在没有才用 id
+      id: r.mid, n: r.mn || mm.n || String(r.mid), g: mm.g || '其他', t: mm.tm || '',
       val: 0, num: 0, cnt: 0, senders: new Map(), gifts: new Map(), last: 0, live: 0, room: 0,
     };
     memberMap.set(r.mid, m);
@@ -54,14 +74,14 @@ for (const r of items) {
   if (r.t > m.last) m.last = r.t;
   if (Number(r.room) === 2) m.live++; else m.room++;
 
-  const ms = m.senders.get(r.sid) || { id: r.sid, n: r.sn, val: 0, num: 0, cnt: 0 };
-  ms.val += val; ms.num += num; ms.cnt++; m.senders.set(r.sid, ms);
+  const ms = m.senders.get(skey) || { id: sid, n: r.sn, val: 0, num: 0, cnt: 0 };
+  ms.val += val; ms.num += num; ms.cnt++; m.senders.set(skey, ms);
 
   const mg = m.gifts.get(r.g) || { g: r.g, v: price, num: 0, cnt: 0, val: 0 };
   mg.num += num; mg.cnt++; mg.val += val; m.gifts.set(r.g, mg);
 
-  let s = senderMap.get(r.sid);
-  if (!s) { s = { id: r.sid, n: r.sn || String(r.sid), val: 0, num: 0, cnt: 0, to: new Set() }; senderMap.set(r.sid, s); }
+  let s = senderMap.get(skey);
+  if (!s) { s = { id: sid, n: r.sn || String(sid || '匿名'), val: 0, num: 0, cnt: 0, to: new Set() }; senderMap.set(skey, s); }
   s.val += val; s.num += num; s.cnt++; s.to.add(r.mid);
 
   let g = giftMap.get(r.g);
@@ -378,9 +398,10 @@ const html = String.raw`<!DOCTYPE html>
       if (!arr.length) { box.innerHTML = '<div class="empty">没有匹配</div>'; return; }
       for (i=0;i<arr.length;i++){
         x = arr[i];
-        var sub = x.g + (x.t && x.t !== x.g ? ' · ' + x.t : '')
-          + ' · 房 ' + (x.room || 0) + ' / 播 ' + (x.live || 0)
-          + ' · ' + x.num + ' 件';
+        // 队名去掉「TEAM 」前缀，给「房/播」腾地方（一行放不下会被省略号吃掉尾巴）
+        var tm2 = String(x.t || '').replace(/^TEAM\s+/i, '');
+        var sub = x.g + (tm2 && tm2 !== x.g ? ' · ' + tm2 : '')
+          + ' · 房' + (x.room || 0) + '/播' + (x.live || 0);
         html += '<button class="row tap" data-mid="'+x.id+'">'
           + '<span class="rk'+(i<3?' g'+(i+1):'')+'">'+(i+1)+'</span>'
           + '<span class="av">'+esc(String(x.n).slice(0,1))+'</span>'
