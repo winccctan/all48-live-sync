@@ -1,0 +1,46 @@
+# 公演榜 · 官方鸡腿榜对账（每 15 秒拉一次 live.48.cn）
+#
+# 为什么单独一条：
+#   perf.yml 一轮 55 分钟靠 concurrency 接棒，中间会有几分钟空档；对账必须更密。
+#   这条每轮只跑 10 分钟、内部 15 秒一拉，独立 concurrency 组，由 worker 的 */2 cron 拨号。
+#
+# 口径：官方 hot = 公演鸡腿（与 App 完全一致）；只增不删——官方 > 我们才补（g='补账'）。
+name: 公演榜 · 官方对账
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: '本轮跑多少分钟'
+        default: '10'
+  schedule:
+    - cron: '*/5 * * * *'   # 兜底（真正拨号在 worker 的 */2 cron）
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-hot
+  cancel-in-progress: false
+
+jobs:
+  hot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 官方鸡腿榜对账
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          LV_TOKEN: ${{ secrets.LV_TOKEN }}
+          RUN_MINUTES: ${{ inputs.run_minutes || '10' }}
+          TICK_MS: '15000'
+          PERF_PAGE_ANCHOR: ${{ vars.PERF_PAGE_ANCHOR }}
+        run: |
+          if [ -z "$SITE_URL" ]; then export SITE_URL="https://all48-archive.yqz-tansy.workers.dev"; fi
+          if [ -z "$LV_TOKEN" ]; then export LV_TOKEN="$INGEST_TOKEN"; fi
+          node perf-hot-sync.mjs

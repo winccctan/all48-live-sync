@@ -83,7 +83,7 @@ jobs:
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           LV_TOKEN: ${{ secrets.LV_TOKEN }}
           RUN_MINUTES: '55'
-          TICK_MS: '25000'
+          TICK_MS: '15000'
           PERF_PAGE_ANCHOR: ${{ vars.PERF_PAGE_ANCHOR }}
         run: |
           if [ -z "$SITE_URL" ]; then export SITE_URL="https://all48-archive.yqz-tansy.workers.dev"; fi
