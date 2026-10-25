@@ -64,3 +64,28 @@ jobs:
           FLUSH_MS: '6000'
           SHARD: ${{ matrix.shard }}
         run: node perf-gift-sync.mjs
+
+  # 🔴 官方对账（2026-10-25 站长：「公演鸡腿不允许丢数据」）
+  #    公演礼物只有 48fan 弹幕流一个来源，流一断就永久少分。
+  #    这里每 25 秒拉一次 live.48.cn 的官方成员鸡腿榜，差多少补多少 ⇒ 榜面永远等于官方。
+  #    和上面的采集 job 完全独立：采集挂了它照样对账，对账挂了采集照常跑。
+  hot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 官方鸡腿榜对账
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          LV_TOKEN: ${{ secrets.LV_TOKEN }}
+          RUN_MINUTES: '55'
+          TICK_MS: '25000'
+          PERF_PAGE_ANCHOR: ${{ vars.PERF_PAGE_ANCHOR }}
+        run: |
+          if [ -z "$SITE_URL" ]; then export SITE_URL="https://all48-archive.yqz-tansy.workers.dev"; fi
+          if [ -z "$LV_TOKEN" ]; then export LV_TOKEN="$INGEST_TOKEN"; fi
+          node perf-hot-sync.mjs
