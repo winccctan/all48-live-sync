@@ -20,8 +20,14 @@
  *   SCRAPE_PROXY              国内代理（必填，海外 IP 一律 403）
  *   LG_MAX                    本轮最多扫几场（默认 25）
  *   LG_SINCE                  只扫这之后开的场（'YYYY-MM-DD'，默认今天往前 3 天）
+ *   ALL=1                     🔴 额外把**每一款礼物**（不只是弦月回响）按价写成「鸡腿榜」数据：
+ *                             本地 JSON（OUT）+ POST /api/lv/all → R2 lv:all:YYYYMMDD
+ *                             room 记 2（成员直播侧），带 priceOf() 算出的单价与总额
+ *   OUT                       配合 ALL=1，写一份本地 json（GitHub runner 上可当 artifact）
  */
 import { postJson } from './lib/api.mjs';
+import { priceOf } from './lib/gift-price.mjs';
+import { writeFileSync } from 'node:fs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
@@ -131,7 +137,10 @@ async function listLives() {
 }
 
 const all = await listLives();
-const todo = all.filter((x) => x.ctime >= SINCE && !lives[x.liveId]).slice(0, MAX);
+// ALL_FORCE=1：无视「已扫过」游标，把 SINCE 之后的所有场次重扫一遍
+// （补鸡腿榜历史时用；重扫只会产生相同去重键，站点侧不会重复计分）
+const FORCE = process.env.ALL_FORCE === '1';
+const todo = all.filter((x) => x.ctime >= SINCE && (FORCE || !lives[x.liveId])).slice(0, MAX);
 log(`直播共 ${all.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
 
 /* ---------- ④ 逐场抽礼物 ---------- */
@@ -139,6 +148,9 @@ const RE_TAB = /^\[(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+?)\t\s*送�
 const RE_SP = /^\[(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+?)\s{2,}送给\s*(.+?)\s+(\d+)\s*个\s*(.+?)\s*$/;
 
 const items = [];
+const allItems = [];              // ALL=1：全部礼物（鸡腿榜用）
+const ALL = process.env.ALL === '1';
+const OUT = process.env.OUT || '';
 const newLives = {};
 const seenGiftNames = {};
 let scanned = 0, hit = 0, noLrc = 0, unmatched = {}, linesTotal = 0;
@@ -178,12 +190,16 @@ for (const lv of todo) {
     const gift = String(m[8]).trim();
     got++;
     seenGiftNames[gift] = (seenGiftNames[gift] || 0) + 1;
-    if (!isTarget(gift)) continue;
-    const mid = memberUid(tgt);
-    if (!mid) { unmatched[tgt] = (unmatched[tgt] || 0) + 1; continue; }
     // 弹幕时间戳是「开播后经过时间」，加上开播时间才是绝对时间。
     // 🔴 必须是绝对时间：同一场会被重扫，只有 t 稳定，站点侧去重才有效。
     const t = lv.ctime + ((hh * 3600 + mi * 60 + ss) * 1000 + ms);
+    const mid = memberUid(tgt);
+    if (ALL) {
+      // 鸡腿榜：一款礼物都不落，单价按现行价目表算（弹幕这类不計价的道具 priceOf 会给 0）
+      allItems.push({ t, mid: mid || 0, sid: 0, sn: nick, g: gift, num, v: priceOf('', gift), room: 2 });
+    }
+    if (!isTarget(gift)) continue;
+    if (!mid) { unmatched[tgt] = (unmatched[tgt] || 0) + 1; continue; }
     items.push({ t, mid, sid: 0, sn: nick, gid: '', g: gift, num, src: 1 });
     target++;
   }
@@ -201,6 +217,45 @@ if (Object.keys(seenGiftNames).length) {
   log('含「弦月」的礼物：' + JSON.stringify(near));
 }
 if (Object.keys(unmatched).length) log('⚠️ 对不上成员的 target：' + JSON.stringify(unmatched));
+
+/* ---------- ④b 鸡腿榜：全部礼物（ALL=1） ---------- */
+if (ALL) {
+  // 归不到成员的行（弹幕昵称对不上名册）算不出「谁的鸡腿」，只统计不写库
+  const priced = allItems.filter((x) => x.mid);
+  let val = 0, num = 0, zero = 0;
+  const byGift = {};
+  for (const r of priced) {
+    val += (r.v || 0) * r.num;
+    num += r.num;
+    if (!r.v) zero++;
+    byGift[r.g] = (byGift[r.g] || 0) + r.num;
+  }
+  log(`\n[ALL] 全部礼物 ${allItems.length} 条（可归户 ${priced.length}）· 鸡腿 ${val} · 件数 ${num} · 未知价 ${zero} 条`);
+  log('[ALL] 礼物 TOP15：' + JSON.stringify(Object.entries(byGift).sort((a, b) => b[1] - a[1]).slice(0, 15)));
+
+  if (OUT) {
+    writeFileSync(OUT, JSON.stringify({ at: Date.now(), ch: 'live', items: priced }, null, 0));
+    log('[ALL] 写到 ' + OUT);
+  }
+  // 上报站点 → R2 lv:all:YYYYMMDD（本地 demo 从这里取数，不依赖 runner 产物）
+  let pushed = 0;
+  for (let i = 0; i < priced.length; i += 2000) {
+    const part = priced.slice(i, i + 2000);
+    try {
+      const res = await fetch(SITE + '/api/lv/all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+        body: JSON.stringify({ ch: 'live', items: part }),
+      });
+      const out = await res.json().catch(() => ({}));
+      pushed += part.length;
+      log(`[ALL] 上报 ${part.length} 条 → ${JSON.stringify(out.days || out).slice(0, 160)}`);
+    } catch (e) {
+      log('[ALL] 上报失败：' + String(e.message).slice(0, 120));
+    }
+  }
+  log(`[ALL] 共上报 ${pushed} 条`);
+}
 
 /* ---------- ⑤ 上报 ---------- */
 if (!items.length && !Object.keys(newLives).length) {

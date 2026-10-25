@@ -1,0 +1,84 @@
+# 鸡腿榜数据回填（红蓝活动「弦月回响」之外的通用礼物数据）
+#
+# 为什么单独一条：
+#   `gift-sync` / `live-gift-sync` 只留目标礼物（弦月回响）并上报 gift:day；
+#   而「礼物鸡腿榜」要按**单价 × 数量**统计**所有**礼物，得另存一份明细。
+#   房间侧走 giftall-sync.mjs（扫全团大家房间），直播侧走回放弹幕（live-gift-sync.mjs ALL=1，
+#   因为直播间送礼不进房间 IM）。两边都 POST 到站点 `/api/lv/all` → R2 `lv:all:YYYYMMDD`，
+#   本地 `build-lv-demo.mjs` 直接从这里取数（不用下载 Actions 产物）。
+#
+# 🔴 不是高频任务：房间侧一轮扫 500+ 房间 × 3 页，直播侧要逐场下载 LRC。
+#    默认每天凌晨跑一次（北京 03:00），也能被站点 Worker `/api/tick?lv=1` 手动拨。
+name: 鸡腿榜数据回填
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: '从哪天开始（北京日期 YYYY-MM-DD，默认昨天 00:00）'
+        default: ''
+      pages:
+        description: '房间侧每人往回翻几页（50 条/页）'
+        default: '3'
+      conc:
+        description: '房间侧并发'
+        default: '6'
+      lgmax:
+        description: '直播侧最多扫几场'
+        default: '80'
+  schedule:
+    # 每天 UTC 19:00 = 北京 03:00（活动结束后、数据最全的时点）
+    - cron: '0 19 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lv
+  cancel-in-progress: false
+
+jobs:
+  room:
+    name: 房间侧全礼物
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 扫全团房间礼物
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          PAGES: ${{ inputs.pages || '3' }}
+          CONC: ${{ inputs.conc || '6' }}
+          SINCE_INPUT: ${{ inputs.since }}
+        run: |
+          if [ -n "$SINCE_INPUT" ]; then
+            export SINCE=$(node -e "console.log(Date.parse('${SINCE_INPUT}T00:00:00+08:00'))")
+          fi
+          node giftall-sync.mjs
+
+  live:
+    name: 直播侧回放弹幕（全礼物）
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 逐场下载 LRC 并计价
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          ALL: '1'
+          ALL_FORCE: '1'          # 历史场次当初没留全礼物，这里强行重扫一遍
+          LG_SINCE: ${{ inputs.since || '2026-10-23' }}
+          LG_MAX: ${{ inputs.lgmax || '80' }}
+        run: node live-gift-sync.mjs

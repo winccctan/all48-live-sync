@@ -116,3 +116,30 @@ log('礼物分布：' + JSON.stringify(Object.entries(stats).sort((a, b) => b[1]
 
 writeFileSync(OUT, JSON.stringify({ at: Date.now(), since: SINCE, items }, null, 0));
 log('写到 ' + OUT);
+
+/* 顺手推一份到站点 R2（lv:all:YYYYMMDD）：本地 demo 直接从 /api/lv/all 取数，
+   省掉「Actions 产物还得手动下载」那一步。PUSH=0 可以跳过。 */
+if (process.env.PUSH !== '0' && items.length) {
+  const INGEST = process.env.INGEST_TOKEN || '';
+  if (!INGEST) {
+    log('跳过上报：没有 INGEST_TOKEN');
+  } else {
+    let pushed = 0;
+    for (let i = 0; i < items.length; i += 2000) {
+      const part = items.slice(i, i + 2000);
+      try {
+        const res = await fetch(SITE + '/api/lv/all', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+          body: JSON.stringify({ ch: 'room', items: part }),
+        });
+        const out = await res.json().catch(() => ({}));
+        pushed += part.length;
+        log(`上报 ${part.length} 条 → ${JSON.stringify(out.days || out).slice(0, 160)}`);
+      } catch (e) {
+        log('上报失败：' + String(e.message).slice(0, 120));
+      }
+    }
+    log(`共上报 ${pushed} 条`);
+  }
+}
