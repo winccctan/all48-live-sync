@@ -148,7 +148,11 @@ function onGift(room, m) {
   const num = Math.max(1, Math.floor(Number(gi.giftNum) || 1));
   const v = priceOf(String(gi.giftId || ''), gname);
   const rec = {
-    t, mid, sid: 0, sn: String(m.sender || m.senderName || '').slice(0, 40),
+    // 🔴 sid = 公演直播间 id（= 场次 id）：这是「这条礼物属于哪一场」的唯一可靠证据。
+    //    写 0 的话站点只能按成员名册的团去猜时间窗，兼任成员（如 GNZ48 的她上 SNH48 NII 公演）会归错队；
+    //    13:45 这种四个剧场同时开演的时刻更是必错。
+    // 🔴 必须是**字符串**：19 位 id 超过 Number.MAX_SAFE_INTEGER，转数字会末位失真，归场直接失效。
+    t, mid, sid: String(room.id || ''), sn: String(m.sender || m.senderName || '').slice(0, 40),
     g: gname, num, v, room: 3,
   };
   pending.push(rec);
