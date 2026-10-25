@@ -46,7 +46,9 @@ jobs:
   reconcile:
     runs-on: ubuntu-latest
     # 两路（直播 + 房间）串行跑，房间缺口大的首轮会久一些；xox48 限流又不能开并发
-    timeout-minutes: 18
+    # 🔴 2026-10-26：原来 18 分钟，实测「排队 7 分钟 + 只跑 4 分钟就被 cancel」⇒ 后半程成员永远补不到。
+    #    现在按「真跑满 25 分钟」给额度，Worker 侧的 ZOMBIE_MIN 也同步放到 30 分钟。
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
