@@ -103,6 +103,30 @@ async function main() {
     if (++done % 50 === 0) log(`  明细 ${done}/${total}`);
   });
 
+  // 🔴 跨队重复（2026-10-25 发现）：官方 condition 里同一个 memberId 会出现在**两支队伍**，
+  //    转队后旧队名单没清，且 query/mvp 按不同 teamId 返回**不同分数**。
+  //    实测 255 条目只有 245 个不同成员，10 人重复，例：
+  //      张琼予  GNZ48 TEAM G 9,782,051.5  /  SNH48 TEAM X 126,024.5
+  //      朱怡欣  SNH48 TEAM NII 5,981,553  /  GNZ48 TEAM Z 421,209
+  //    一个人只能占一个名次 ⇒ 取**分数最高**的那条当主身份（= 当前主力队伍），
+  //    队伍榜也只在该队保留她，避免同一个人在两支队榜里各出现一次。
+  const mainOf = new Map();
+  teams.forEach((t) => t.members.forEach((m) => {
+    const cur = mainOf.get(m.memberId);
+    if (!cur || m.total > cur.total) mainOf.set(m.memberId, { teamId: t.teamId, total: m.total });
+  }));
+  let dropped = 0;
+  teams.forEach((t) => {
+    const before = t.members.length;
+    t.members = t.members.filter((m) => {
+      const isMain = mainOf.get(m.memberId).teamId === t.teamId;
+      if (!isMain) dropped++;
+      return isMain;
+    });
+    if (t.members.length !== before) log(`  · ${t.teamName} 去掉 ${before - t.members.length} 条跨队重复`);
+  });
+  if (dropped) log(`跨队重复：合并 ${dropped} 条，实际成员 ${mainOf.size} 人`);
+
   // 队内排名
   teams.forEach((t) => {
     t.members.sort((a, b) => b.total - a.total);
