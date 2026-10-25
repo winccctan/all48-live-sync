@@ -225,8 +225,14 @@ async function memberWorker() {
       }
       if (!got) emptyCount++;
       else okCount++;
-      // 游标只推进到「实际扫到的最旧一条」，房间太吵没扫完也不会把中间那段永久跳过
-      if (oldest !== Infinity && oldest > since) newCur[uid] = oldest;
+      // 游标只推进到「实际扫到的最旧一条」，房间太吵没扫完也不会把中间那段永久跳过。
+      // 🔴 2026-10-26：再夹一道 now —— 只要游标被写成未来时间，之后所有真实消息都会
+      //    被 `g.t <= since` 跳过，抓取每轮 success 却一条不进（红蓝歌会整段停更）。
+      if (oldest !== Infinity && oldest > since) {
+        const cap = Date.now();
+        newCur[uid] = Math.min(oldest, cap);
+        if (oldest > cap + 60000) log(`  ⚠️ ${m.n || uid} 消息时间在未来（${new Date(oldest).toISOString()}），已夹到当前时间`);
+      }
     } catch (e) {
       errCount++;
       log(`  ${m.n || uid} 失败：` + String(e.message).slice(0, 80));
