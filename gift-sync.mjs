@@ -29,6 +29,7 @@
  *   DRY=1         只打印不提交
  */
 import { fetchMessagePage } from './lib/api.mjs';
+import { priceOf } from './lib/gift-price.mjs';
 
 const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
@@ -171,6 +172,11 @@ log(`本轮扫 ${uids.length} 个房间` + (DRY ? '（DRY）' : ''));
 
 /* ---------- ③ 逐房间扫 ---------- */
 const items = [];
+// 🔴 鸡腿榜（lv:all）要**每一款**礼物，不只是弦月回响。
+//    这条快扫 2 分钟一轮，顺手把全量礼物也推一份 ⇒ 鸡腿榜的房间侧从此是实时的，
+//    不用再等 lv.yml（以前 2 小时一轮，站长看到的一直是旧数）。
+//    跟目标礼物共用同一个游标，所以不会重复推；重复的由 worker 的 lvKey 兜底。
+const lvItems = [];
 const stats = {};          // 本轮见到的所有礼物名 → 次数（用于核对目标礼物写法）
 const ids = {};            // giftId → 礼物名（用来认出 888xxx 活动道具的真实 id）
 const newCur = {};
@@ -204,8 +210,12 @@ async function memberWorker() {
           const nm = g.g || ('gid:' + g.gid);
           stats[nm] = (stats[nm] || 0) + 1;
           if (g.gid) ids[g.gid] = g.g;
+          if (since && g.t <= since) continue;   // 上一轮已经上报过（目标礼物与鸡腿榜共用这个游标）
+          lvItems.push({
+            t: g.t, mid: g.mid, sid: 0, sn: g.sn, g: g.g, num: g.num,
+            v: priceOf(g.gid, g.g), room: 1, ch: 'room',
+          });
           if (!isTarget(g.gid, g.g)) continue;
-          if (since && g.t <= since) continue;   // 已经上报过
           items.push(g);
         }
         // 已经翻到「上轮扫过的位置」就不用再往前了
@@ -273,3 +283,27 @@ for (let i = 0; i < chunks.length; i++) {
 }
 log(`完成：上报 ${sent} 条 / 失败 ${fail} 条 · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 if (fail && !sent) process.exitCode = 1;
+
+/* ---------- ⑤ 鸡腿榜：全量礼物（room=1） ----------
+   失败不致命：lv.yml 每 2 小时还会做一次「从昨天 0 点起」的深扫兜底，
+   漏掉的那几条会在下一轮被补回来（lvKey 去重，不会重复计分）。 */
+if (lvItems.length) {
+  let lvOk = 0, lvFail = 0;
+  for (let i = 0; i < lvItems.length; i += BATCH) {
+    const part = lvItems.slice(i, i + BATCH);
+    try {
+      const res = await site('/api/lv/all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+        body: JSON.stringify({ ch: 'room', items: part }),
+      }, { timeout: 60000, retries: 1 });
+      const out = await res.json().catch(() => ({}));
+      lvOk += part.length;
+      log(`鸡腿榜 ${part.length} 条 → ${JSON.stringify(out.days || out).slice(0, 140)}`);
+    } catch (e) {
+      lvFail += part.length;
+      log(`鸡腿榜上报失败：` + String(e.message).slice(0, 110));
+    }
+  }
+  log(`鸡腿榜：上报 ${lvOk} 条 / 失败 ${lvFail} 条`);
+}

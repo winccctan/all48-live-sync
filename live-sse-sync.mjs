@@ -34,6 +34,7 @@
  */
 import http from 'node:http';
 import fs from 'node:fs';
+import { priceOf } from './lib/gift-price.mjs';
 
 const F48 = process.env.F48_BASE || 'https://48fan.com';
 const UA = process.env.F48_UA
@@ -83,7 +84,8 @@ const say = (...a) => console.log(new Date(Date.now() + BJ).toISOString().slice(
 /* ───────────────────────────── 运行时状态 ───────────────────────────── */
 const rooms = new Map();  // liveId -> { liveId, nick, clientId, abort, state, nMsg, nGift, lastEvAt, tries, nextTryAt, coveredFrom }
 const seenMsg = new Set(); // msgId 去重（内存，滚动清）
-let pending = [];          // 待上报
+let pending = [];          // 待上报（只含弦月回响，进 gift:day 计分）
+let pendingLv = [];        // 待上报（**每一款**礼物，进鸡腿榜 lv:all，room=2）
 const covered = new Map(); // liveId -> 首次建连成功的时间（给 LRC 补抓判断要不要跳过）
 
 let stopped = false;
@@ -302,7 +304,6 @@ function handleMessage(room, m) {
   const gname = String(gi.giftName || '');
   const gid = String(gi.giftId || '');
   const hit = (GIFT_NAME && gname.includes(GIFT_NAME)) || (gid && GIFT_IDS.includes(gid));
-  if (!hit) return;
 
   const acc = gi.acceptUser || {};
   const mid = Number(acc.userId) || 0;
@@ -319,11 +320,18 @@ function handleMessage(room, m) {
   const num = Math.max(1, Math.floor(Number(gi.giftNum) || 1));
   const sn = String(m.sender || m.senderName || '').slice(0, 40);
 
+  room.nGift++;
+  // 🔴 鸡腿榜要**每一款**礼物，不只是目标礼物（站长 2026-10-25：鸡腿榜一直不动）。
+  //    房间侧已经由 gift-sync 实时推了；直播侧过去只能等直播结束读回放弹幕（2 小时一轮），
+  //    正在播的人永远是 0 分 ⇒ 这里把 SSE 看到的礼物按 room=2 实时写进 lv:all。
+  //    ch='sse'：worker 用它跟 LRC 回放那条通道做跨通道模糊去重（两边时间戳差几秒）。
+  pendingLv.push({ t, mid, sid: room.liveId, sn, g: gname, num, v: priceOf(gid, gname), room: 2, ch: 'sse' });
+  if (!hit) return;
+
   // 🔴 g 必须带（worker 的 isTargetGift 靠「礼物名包含」或「giftId 在白名单」判定，
   //    两个都不给就被当非目标礼物 drop，日志里只会看到 kept=0 —— 2026-10-25 踩过这个坑）。
   // gid 仍留空，跟 LRC 侧保持同构。
   const rec = { t, mid, sid: 0, sn, gid: '', g: gname, num, src: 1 };
-  room.nGift++;
   pending.push(rec);
   say(`  🎁 ${String(acc.starName || acc.userName || mid).padEnd(10)} ${num} 个 ${gname} ← ${sn}  [${room.nick}]`);
 }
@@ -347,6 +355,27 @@ async function flush() {
   } catch (e) {
     say(`  ⚠️ 上报失败（${String(e.message).slice(0, 60)}），${items.length} 条塞回去下次重试`);
     pending = items.concat(pending).slice(-3000);
+  }
+}
+
+/** 鸡腿榜上报（每一款礼物，room=2 → R2 lv:all） */
+async function flushLv() {
+  if (!pendingLv.length) return;
+  const items = pendingLv;
+  pendingLv = [];
+  if (DRY || !SITE) { say(`  (DRY) 鸡腿榜 ${items.length} 条：${JSON.stringify(items.slice(0, 3))}`); return; }
+  try {
+    const r = await fetch(`${SITE}/api/lv/all`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-ingest-token': TOKEN, 'user-agent': 'all48-live-sse/1.0' },
+      body: JSON.stringify({ ch: 'sse', items }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const d = await r.json().catch(() => ({}));
+    say(`  ⬆ 鸡腿榜 ${items.length} 条 → ${JSON.stringify(d.days || d).slice(0, 140)}`);
+  } catch (e) {
+    say(`  ⚠️ 鸡腿榜上报失败（${String(e.message).slice(0, 50)}），${items.length} 条塞回去`);
+    pendingLv = items.concat(pendingLv).slice(-4000);
   }
 }
 
@@ -443,6 +472,7 @@ const server = http.createServer((req, res) => {
       rooms: st,
       gifts: [...rooms.values()].reduce((a, r) => a + r.nGift, 0),
       pending: pending.length,
+      lvPending: pendingLv.length,
       backoffMs: Math.max(0, backoffUntil - Date.now()),
       lastScanAt,
       covered: covered.size,
@@ -461,6 +491,7 @@ const timers = [];
 timers.push(setInterval(() => { scan(); }, RESCAN_MS));
 timers.push(setInterval(() => { connectTick(); }, 1000));
 timers.push(setInterval(() => { flush(); }, FLUSH_MS));
+timers.push(setInterval(() => { flushLv(); }, FLUSH_MS));
 timers.push(setInterval(() => { flushCovered(); }, 60000));
 
 // 僵死连接巡检：60 秒没有任何事件（连 online_update 都没有）就重连
