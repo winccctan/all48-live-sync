@@ -38,10 +38,14 @@ jobs:
     #    48fan 单出口 IP 大约只让开 6 条并发流（第 7 条 429）⇒ 一个 job 盖不住 10 场。
     #    拆 3 片，每片是独立 runner（独立 IP），每片最多 6 场 = 18 个坑位。
     #    分片靠 liveId 的 FNV 哈希（不能取模：末位基本是偶数）。
+    # 🔴 站长 2026-10-25 晚：「公演鸡腿必须实时，要作为比赛依据」。
+    #    公演礼物没有回放、没有 IM 可补（probe-perf-room 已验），流上丢一条就永久少一分。
+    #    ⇒ 每片再派**一个副本**（共 6 个 runner）：同片两个出口 IP 同时听同一批场次，
+    #      两路各自落库、按 t|mid|g|num|room 精确去重，一路断流另一路兜住。
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -56,5 +60,7 @@ jobs:
           RUN_MINUTES: ${{ inputs.run_minutes || '55' }}
           MAX_ROOMS: '6'
           SHARDS: '3'
+          REPLICAS: '2'
+          FLUSH_MS: '6000'
           SHARD: ${{ matrix.shard }}
         run: node perf-gift-sync.mjs

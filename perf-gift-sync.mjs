@@ -31,7 +31,8 @@ const TOKEN = process.env.INGEST_TOKEN || '';
 const DRY = !!process.env.DRY;
 const RUN_MINUTES = Math.max(1, Number(process.env.RUN_MINUTES || 180));
 const RESCAN_MS = Math.max(30000, Number(process.env.RESCAN_MS || 120000));
-const FLUSH_MS = Math.max(5000, Number(process.env.FLUSH_MS || 20000));
+// 🔴 实时：站长拿它当比赛依据，20 秒一批太慢 ⇒ 6 秒就推（单条请求量很小，ingest 是 KV+R2 读改写，别低于 5 秒）
+const FLUSH_MS = Math.max(3000, Number(process.env.FLUSH_MS || 6000));
 const SSE_MAX_MS = Math.max(30000, Number(process.env.SSE_MAX_MS || 185000));
 // 🔴 默认值从 4 提到 6（2026-10-25 事故）：13:45 四剧场同时开演时，13:15 就开演的场次
 //    会被「最新开演优先 + 截断」挤掉，整场一条礼物都收不到（肆时墟就是这样丢掉 1915 鸡腿）。
@@ -45,13 +46,22 @@ const MAX_ROOMS = Math.max(1, Number(process.env.MAX_ROOMS || 6));
  *    「多出口分片」：每个 job 是独立 runner（独立 IP），只负责自己那一片。
  * 🔴 别用 `Number(id) % SHARDS`：公演 liveId 末位基本是偶数，取模只会落在一半分片上。 */
 const SHARDS = Math.max(1, Number(process.env.SHARDS || 1));
-const SHARD = Math.min(SHARDS - 1, Math.max(0, Number(process.env.SHARD || 0)));
+/* 🔴 副本（2026-10-25 站长：「公演鸡腿必须实时，要作为比赛依据」）
+ *    公演礼物**没有回放、没有 IM 可补**（probe 已验），流上丢一条就永久少一分。
+ *    所以每片派两个独立 runner（独立出口 IP）同时听同一批场次，
+ *    两路各自落库、按 t|mid|g|num|room 精确去重 ⇒ 一路断流/丢消息，另一路兜住。
+ *    matrix 里 SHARD 取 0..SHARDS*REPLICAS-1，数据片 = SHARD % SHARDS。 */
+const REPLICAS = Math.max(1, Number(process.env.REPLICAS || 1));
+const TOTAL_SHARDS = SHARDS * REPLICAS;
+const SHARD = Math.min(TOTAL_SHARDS - 1, Math.max(0, Number(process.env.SHARD || 0)));
+const MY_SHARD = SHARD % SHARDS;
+const REPLICA = Math.floor(SHARD / SHARDS);
 function fnv1a(s) {
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
-const inShard = (id) => SHARDS === 1 || (fnv1a(String(id)) % SHARDS) === SHARD;
+const inShard = (id) => SHARDS === 1 || (fnv1a(String(id)) % SHARDS) === MY_SHARD;
 
 const GROUPS = [
   { id: 10, name: 'SNH48' }, { id: 11, name: 'BEJ48' }, { id: 12, name: 'GNZ48' },
@@ -163,7 +173,11 @@ function onGift(room, m) {
   if (msgId) { if (seenMsg.has(msgId)) return; seenMsg.add(msgId); if (seenMsg.size > 50000) seenMsg.clear(); }
 
   const t = Number(m.serverTime) || Math.round(Number(m.ts) * 1000) || Date.now();
-  const num = Math.max(1, Math.floor(Number(gi.giftNum) || 1));
+  /* 🔴 数量字段：48fan 转发的是口袋48 原始消息，理论上 giftNum 就是数量。
+     但公演侧 1160 条历史记录里 **没有一条 num>1**（直播侧同一字段一堆 2/3/5/10），
+     说明要么公演礼物被拆条、要么字段名换了 ⇒ 多读几个候选名，宁可多算也不错算。 */
+  const gnum = gi.giftNum != null ? gi.giftNum : (gi.giftCount != null ? gi.giftCount : gi.num);
+  const num = Math.max(1, Math.floor(Number(gnum) || 1));
   const v = priceOf(String(gi.giftId || ''), gname);
   const rec = {
     // 🔴 sid = 公演直播间 id（= 场次 id）：这是「这条礼物属于哪一场」的唯一可靠证据。
@@ -197,6 +211,7 @@ async function consume(room, clientId) {
   }
   room.state = 'live';
   room.tries = 0;
+  room.lastEv = Date.now();
   say(`● 已连上「${room.title.slice(0, 18)}」(${room.g})`);
   const reader = res.body.getReader();
   const dec = new TextDecoder();
@@ -205,6 +220,7 @@ async function consume(room, clientId) {
     for (;;) {
       const { value, done } = await reader.read();
       if (done) break;
+      room.lastEv = Date.now();
       buf += dec.decode(value, { stream: true });
       let i;
       while ((i = buf.indexOf('\n\n')) >= 0) {
@@ -294,7 +310,7 @@ async function scan() {
   const now = Date.now();
   const all = list.filter((s) => isLive(s, now) && inShard(s.id)).sort((a, b) => b.st - a.st);
   const live = all.slice(0, MAX_ROOMS);
-  if (!live.length) { say(`当前没有在播的公演（分片 ${SHARD}/${SHARDS}，每分钟再看一次）`); return; }
+  if (!live.length) { say(`当前没有在播的公演（片 ${MY_SHARD}/${SHARDS} 副本 ${REPLICA + 1}/${REPLICAS}，每分钟再看一次）`); return; }
   // 🔴 超上限时一定要吼出来：被挤掉的那场会一条礼物都收不到，静默截断最坑。
   if (all.length > live.length) {
     say(`⚠️ 本片在播 ${all.length} 场 > 上限 ${MAX_ROOMS}，未监听：` +
@@ -318,17 +334,34 @@ async function scan() {
   }
 }
 
-say(`公演礼物采集启动：最长 ${RUN_MINUTES} 分钟${DRY ? '（DRY）' : ''}`);
+say(`公演礼物采集启动：最长 ${RUN_MINUTES} 分钟${DRY ? '（DRY）' : ''}，片 ${MY_SHARD}/${SHARDS} 副本 ${REPLICA + 1}/${REPLICAS}，上报间隔 ${FLUSH_MS / 1000}s`);
 await scan();
 
 const tick = setInterval(() => {
   for (const r of rooms.values()) attach(r);
 }, 15000);
+/* 🔴 假活看门狗（2026-10-25「为什么丢数据」）：流断了但 TCP 没报错时，
+ *    读取端会一直挂着等，看起来在听、其实一条都收不到（半开连接）。
+ *    公演聊天室弹幕很密（实测 200 秒 26 条），所以「120 秒一条事件都没有」= 死了，
+ *    主动 soft 断开重连，别干等 SSE_MAX_MS。 */
+const WATCH_MS = 120000;
+const watchTimer = setInterval(() => {
+  const now = Date.now();
+  for (const r of rooms.values()) {
+    if (r.state !== 'live' || !r.lastEv) continue;
+    if (now - r.lastEv > WATCH_MS) {
+      say(`⟳ ${r.g} ${r.title.slice(0, 12)} 静默 ${Math.round((now - r.lastEv) / 1000)}s，判为断流，重连`);
+      r.lastEv = now;                     // 避免下一轮重复触发
+      r.soft = true;                      // 当主动断开处理：不涨退避、立即重连
+      try { r.abort && r.abort.abort(); } catch {}
+    }
+  }
+}, 15000);
 const flushTimer = setInterval(() => { flush(); }, FLUSH_MS);
 const scanTimer = setInterval(() => { scan(); }, RESCAN_MS);
 const doneTimer = setInterval(() => {
   if (stopped || Date.now() - started > RUN_MINUTES * 60e3) {
-    clearInterval(tick); clearInterval(flushTimer); clearInterval(scanTimer); clearInterval(doneTimer);
+    clearInterval(tick); clearInterval(flushTimer); clearInterval(scanTimer); clearInterval(doneTimer); clearInterval(watchTimer);
     for (const r of rooms.values()) { try { r.abort && r.abort.abort(); } catch {} }
     flush().finally(() => {
       say(`结束。监听过的场次 ${rooms.size}，累计礼物 ${[...rooms.values()].reduce((a, b) => a + b.n, 0)} 条`);
