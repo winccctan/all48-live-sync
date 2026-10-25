@@ -378,7 +378,9 @@ const html = String.raw`<!DOCTYPE html>
       if (!arr.length) { box.innerHTML = '<div class="empty">没有匹配</div>'; return; }
       for (i=0;i<arr.length;i++){
         x = arr[i];
-        var sub = x.g + (x.t && x.t !== x.g ? ' · ' + x.t : '') + ' · ' + x.cnt + ' 次 · ' + x.num + ' 件';
+        var sub = x.g + (x.t && x.t !== x.g ? ' · ' + x.t : '')
+          + ' · 房 ' + (x.room || 0) + ' / 播 ' + (x.live || 0)
+          + ' · ' + x.num + ' 件';
         html += '<button class="row tap" data-mid="'+x.id+'">'
           + '<span class="rk'+(i<3?' g'+(i+1):'')+'">'+(i+1)+'</span>'
           + '<span class="av">'+esc(String(x.n).slice(0,1))+'</span>'
