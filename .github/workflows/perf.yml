@@ -24,7 +24,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: perf-gift
+  # 🔴 2026-10-25 换了组名：旧的 `perf-gift` 组里有个僵尸 run（卡在 in_progress 到 65 分钟
+  #    timeout 才放），新 dispatch 全被它挡成 pending。换组名让新代码立刻能跑，
+  #    同一场的重复记录靠 ingest 的精确键去重。
+  group: perf-gift-v2
   cancel-in-progress: false
 
 jobs:
