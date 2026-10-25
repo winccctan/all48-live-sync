@@ -33,7 +33,10 @@ const RUN_MINUTES = Math.max(1, Number(process.env.RUN_MINUTES || 180));
 const RESCAN_MS = Math.max(30000, Number(process.env.RESCAN_MS || 120000));
 const FLUSH_MS = Math.max(5000, Number(process.env.FLUSH_MS || 20000));
 const SSE_MAX_MS = Math.max(30000, Number(process.env.SSE_MAX_MS || 185000));
-const MAX_ROOMS = Math.max(1, Number(process.env.MAX_ROOMS || 4));
+// 🔴 默认值从 4 提到 6（2026-10-25 事故）：13:45 四剧场同时开演时，13:15 就开演的场次
+//    会被「最新开演优先 + 截断」挤掉，整场一条礼物都收不到（肆时墟就是这样丢掉 1915 鸡腿）。
+//    48fan 单出口 IP 大约能开 6 条并发流，所以 6 是上限，再多会 429。
+const MAX_ROOMS = Math.max(1, Number(process.env.MAX_ROOMS || 6));
 
 const GROUPS = [
   { id: 10, name: 'SNH48' }, { id: 11, name: 'BEJ48' }, { id: 12, name: 'GNZ48' },
@@ -274,8 +277,14 @@ async function scan() {
   await pushSessions(list.filter((s) => s.st > Date.now() - 30 * 86400e3));
 
   const now = Date.now();
-  const live = list.filter((s) => isLive(s, now)).sort((a, b) => b.st - a.st).slice(0, MAX_ROOMS);
+  const all = list.filter((s) => isLive(s, now)).sort((a, b) => b.st - a.st);
+  const live = all.slice(0, MAX_ROOMS);
   if (!live.length) { say('当前没有在播的公演（每分钟再看一次）'); return; }
+  // 🔴 超上限时一定要吼出来：被挤掉的那场会一条礼物都收不到，静默截断最坑。
+  if (all.length > live.length) {
+    say(`⚠️ 在播 ${all.length} 场 > 上限 ${MAX_ROOMS}，未监听：` +
+      all.slice(live.length).map((s) => `${s.g} ${(s.title || '').slice(0, 10)}`).join(' / '));
+  }
   for (const s of live) {
     const old = rooms.get(s.id);
     if (old) { Object.assign(old, { title: s.title, team: s.team, status: s.status, et: s.et }); continue; }

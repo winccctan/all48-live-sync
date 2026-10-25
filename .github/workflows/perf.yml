@@ -43,4 +43,6 @@ jobs:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           RUN_MINUTES: ${{ inputs.run_minutes || '55' }}
+          # 🔴 13:45 常有多达 5 场同时开演，上限 4 会把最早开演的那场直接挤掉
+          MAX_ROOMS: '6'
         run: node perf-gift-sync.mjs
