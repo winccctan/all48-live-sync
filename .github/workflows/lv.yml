@@ -14,6 +14,9 @@ name: 鸡腿榜数据回填
 on:
   workflow_dispatch:
     inputs:
+      only:
+        description: '只跑哪部分：all / room / live'
+        default: 'all'
       since:
         description: '从哪天开始（北京日期 YYYY-MM-DD，默认昨天 00:00）'
         default: ''
@@ -40,6 +43,7 @@ concurrency:
 jobs:
   room:
     name: 房间侧全礼物
+    if: ${{ (inputs.only || 'all') != 'live' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -70,6 +74,7 @@ jobs:
 
   live:
     name: 直播侧回放弹幕（全礼物）
+    if: ${{ (inputs.only || 'all') != 'room' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
