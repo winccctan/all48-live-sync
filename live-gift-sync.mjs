@@ -140,7 +140,12 @@ const all = await listLives();
 // ALL_FORCE=1：无视「已扫过」游标，把 SINCE 之后的所有场次重扫一遍
 // （补鸡腿榜历史时用；重扫只会产生相同去重键，站点侧不会重复计分）
 const FORCE = process.env.ALL_FORCE === '1';
-const todo = all.filter((x) => x.ctime >= SINCE && (FORCE || !lives[x.liveId])).slice(0, MAX);
+let cands = all.filter((x) => x.ctime >= SINCE && (FORCE || !lives[x.liveId]));
+/* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
+   每轮都只重扫「最新的 MAX 场」，10-24 下午那批永远轮不到
+   （2026-10-25 实测：10-24 22:00 之前的 room=2 一条都没有，就是这个原因）。 */
+if (FORCE) cands = cands.slice().sort((a, b) => a.ctime - b.ctime);
+const todo = cands.slice(0, MAX);
 log(`直播共 ${all.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
 
 /* ---------- ④ 逐场抽礼物 ---------- */
