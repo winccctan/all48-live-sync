@@ -38,6 +38,21 @@ const SSE_MAX_MS = Math.max(30000, Number(process.env.SSE_MAX_MS || 185000));
 //    48fan 单出口 IP 大约能开 6 条并发流，所以 6 是上限，再多会 429。
 const MAX_ROOMS = Math.max(1, Number(process.env.MAX_ROOMS || 6));
 
+/* ───────────────────── 分片（多出口） ─────────────────────
+ * 🔴 站长 2026-10-25：「同时段可能 10 场公演的」。
+ *    48fan 单出口 IP 大约只能开 6 条并发流（第 7 条 429，冷却也没用），
+ *    一个 job 单 IP 无论如何都盖不住 10 场 ⇒ 必须像 live-sse-sync 那样按
+ *    「多出口分片」：每个 job 是独立 runner（独立 IP），只负责自己那一片。
+ * 🔴 别用 `Number(id) % SHARDS`：公演 liveId 末位基本是偶数，取模只会落在一半分片上。 */
+const SHARDS = Math.max(1, Number(process.env.SHARDS || 1));
+const SHARD = Math.min(SHARDS - 1, Math.max(0, Number(process.env.SHARD || 0)));
+function fnv1a(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+const inShard = (id) => SHARDS === 1 || (fnv1a(String(id)) % SHARDS) === SHARD;
+
 const GROUPS = [
   { id: 10, name: 'SNH48' }, { id: 11, name: 'BEJ48' }, { id: 12, name: 'GNZ48' },
   { id: 14, name: 'CKG48' }, { id: 21, name: 'CGT48' },
@@ -277,12 +292,12 @@ async function scan() {
   await pushSessions(list.filter((s) => s.st > Date.now() - 30 * 86400e3));
 
   const now = Date.now();
-  const all = list.filter((s) => isLive(s, now)).sort((a, b) => b.st - a.st);
+  const all = list.filter((s) => isLive(s, now) && inShard(s.id)).sort((a, b) => b.st - a.st);
   const live = all.slice(0, MAX_ROOMS);
-  if (!live.length) { say('当前没有在播的公演（每分钟再看一次）'); return; }
+  if (!live.length) { say(`当前没有在播的公演（分片 ${SHARD}/${SHARDS}，每分钟再看一次）`); return; }
   // 🔴 超上限时一定要吼出来：被挤掉的那场会一条礼物都收不到，静默截断最坑。
   if (all.length > live.length) {
-    say(`⚠️ 在播 ${all.length} 场 > 上限 ${MAX_ROOMS}，未监听：` +
+    say(`⚠️ 本片在播 ${all.length} 场 > 上限 ${MAX_ROOMS}，未监听：` +
       all.slice(live.length).map((s) => `${s.g} ${(s.title || '').slice(0, 10)}`).join(' / '));
   }
   for (const s of live) {

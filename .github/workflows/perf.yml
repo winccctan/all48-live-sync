@@ -31,18 +31,27 @@ jobs:
   perf:
     runs-on: ubuntu-latest
     timeout-minutes: 65
+    # 🔴 站长 2026-10-25：「同时段可能 10 场公演的」。
+    #    48fan 单出口 IP 大约只让开 6 条并发流（第 7 条 429）⇒ 一个 job 盖不住 10 场。
+    #    拆 3 片，每片是独立 runner（独立 IP），每片最多 6 场 = 18 个坑位。
+    #    分片靠 liveId 的 FNV 哈希（不能取模：末位基本是偶数）。
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: 盯公演弹幕 + 推场次
+      - name: 盯公演弹幕 + 推场次（分片 ${{ matrix.shard }}）
         env:
           SITE_URL: ${{ vars.SITE_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           RUN_MINUTES: ${{ inputs.run_minutes || '55' }}
-          # 🔴 13:45 常有多达 5 场同时开演，上限 4 会把最早开演的那场直接挤掉
           MAX_ROOMS: '6'
+          SHARDS: '3'
+          SHARD: ${{ matrix.shard }}
         run: node perf-gift-sync.mjs
