@@ -143,9 +143,14 @@ const FORCE = process.env.ALL_FORCE === '1';
 let cands = all.filter((x) => x.ctime >= SINCE && (FORCE || !lives[x.liveId]));
 /* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
    每轮都只重扫「最新的 MAX 场」，10-24 下午那批永远轮不到
-   （2026-10-25 实测：10-24 22:00 之前的 room=2 一条都没有，就是这个原因）。 */
+   （2026-10-25 实测：10-24 22:00 之前的 room=2 一条都没有，就是这个原因）。
+   🔴🔴 2026-10-26 二次修正：升序取**前** MAX 又走到了另一个极端 ——
+   cron 走 only=all（ALL_FORCE=1）且 LG_SINCE 默认 '2026-10-23'，一天 100+ 场，
+   于是每 2 小时都只重扫 10-23 最早那 80 场，**今天的场次永远轮不到**。
+   当天 room=2 只剩 53 条（正常 3000+）、谢晓倩/王语晨/项宇婧 直接归零，就是这个。
+   ⇒ 日常取**最新**的 MAX 场（slice(-MAX)），要回填历史用 since 显式指定起点。 */
 if (FORCE) cands = cands.slice().sort((a, b) => a.ctime - b.ctime);
-const todo = cands.slice(0, MAX);
+const todo = FORCE ? cands.slice(-MAX) : cands.slice(0, MAX);
 log(`直播共 ${all.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
 
 /* ---------- ④ 逐场抽礼物 ---------- */

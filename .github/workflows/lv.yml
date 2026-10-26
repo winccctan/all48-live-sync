@@ -92,6 +92,8 @@ jobs:
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
           ALL: '1'
           ALL_FORCE: '1'          # 历史场次当初没留全礼物，这里强行重扫一遍
-          LG_SINCE: ${{ inputs.since || '2026-10-23' }}
-          LG_MAX: ${{ inputs.lgmax || '80' }}
+          # 🔴 不要写死 '2026-10-23'：配合「升序取前 MAX」会让每轮都卡在最早那批。
+          #    留空 → 脚本默认「今天往前 3 天」，再配合 slice(-MAX) 取最新的 MAX 场。
+          LG_SINCE: ${{ inputs.since || '' }}
+          LG_MAX: ${{ inputs.lgmax || '150' }}
         run: node live-gift-sync.mjs
