@@ -4,15 +4,15 @@
 #   POST /scan/api/scan/v2/get/condition  → 18 队 / 255 人
 #   POST /scan/api/scan/v1/query/mvp      → 逐人明细（必须逐人查，只传 teamId 会 500）
 #
-# 频率：每周三北京时间 12:01（UTC 04:01）。
-#   · GitHub 自己的 schedule 在这个仓库上历史上不激活（实测 4 小时 0 次），
-#     所以真正触发靠 Worker 的 Cron Trigger（1 4 * * 3）去调 workflow_dispatch；
-#     这里的 schedule 保留作二层保障，不冲突（脚本自身幂等，重复跑只是覆盖同一份数据）。
+# 频率：每周三北京时间 12:01（UTC 04:01），**只由 Worker 的 Cron Trigger 触发**。
+#   🔴 2026-10-28 事故：这里原来还留了一条 `schedule: 1 4 * * 3` 作「二层保障」，
+#      结果 GitHub 自己的调度当天 18:24（北京，迟到 6.5 小时）又跑了一次，
+#      POST /api/mvp/put 把「上一次基准」挤成当天那期，全站增量瞬间全变 0。
+#      ⇒ 已删除 schedule，只保留 workflow_dispatch（Worker cron / 兜底 / 人工急救都走它）。
+#      服务端另有硬闸：只接受「北京周三 11:50–13:10」的写入，其余一律 409。
 name: MVP 榜
 
 on:
-  schedule:
-    - cron: '1 4 * * 3'
   workflow_dispatch:
 
 permissions:

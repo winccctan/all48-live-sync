@@ -167,11 +167,20 @@ async function main() {
 
   const res = await fetch(SITE + '/api/mvp/put', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST, Accept: 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'x-ingest-token': INGEST,
+      Accept: 'application/json',
+      // 服务端只允许「北京周三 11:50–13:10」写入（站长 2026-10-28 铁律）。
+      // 人工急救补一期时才用 MVP_FORCE=1 越过窗口。
+      ...(process.env.MVP_FORCE === '1' ? { 'x-mvp-force': '1' } : {}),
+    },
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(90000),
   });
   const txt = await res.text();
+  // 409 = 不在更新窗口（或同期重复被拦）；这不是抓取失败，但必须让人看见，不能静默成功
+  if (res.status === 409) throw new Error(`被服务端拒绝（不在周三 12:01 窗口）：${txt.slice(0, 200)}`);
   if (!res.ok) throw new Error(`上报失败 HTTP ${res.status} ${txt.slice(0, 200)}`);
   log(`上报完成 ${txt} · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s · 体积 ${(JSON.stringify(payload).length / 1024).toFixed(1)}KB`);
 }
