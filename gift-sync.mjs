@@ -24,7 +24,10 @@
  *   GIFT_NAME     目标礼物名（默认「弦月回响」）
  *   GIFT_IDS      额外的 giftId 白名单（逗号分隔，防改名）
  *   CONC          并发（默认 6）
- *   GIFT_PAGES    每人最多往回翻几页（默认 3，一页 50 条）
+ *   GIFT_PAGES    每人最多往回翻几页（默认 12，一页 50 条）
+ *                 🔴 2026-10-31：从 3 提到 12。翻到「上轮游标」就早停，空闲房间只翻 1 页、
+ *                    成本几乎不变；但只要通道断过一轮（Actions 排队被取消、代理抖动），
+ *                    12 页 = 600 条能覆盖 1~2 小时，断档可以自己补回来，不再永久丢分。
  *   MAX_MEMBERS   单轮最多扫多少人（默认 600 = 全员）
  *   DRY=1         只打印不提交
  */
@@ -35,7 +38,7 @@ const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const CONC = Math.max(1, Number(process.env.CONC || 6));
-const PAGES = Math.max(1, Number(process.env.GIFT_PAGES || 3));
+const PAGES = Math.max(1, Number(process.env.GIFT_PAGES || 12));
 const MAX_MEMBERS = Number(process.env.MAX_MEMBERS || 600);
 const PAGE_LIMIT = 50;      // 实测上限就是 50，传更大没有意义
 const DRY = !!process.env.DRY;
@@ -159,9 +162,13 @@ try {
   log('读补充名册失败（不影响本轮）：' + String(e.message).slice(0, 80));
 }
 
-// 只扫「有房间、且不是荣誉毕业生」的人（毕业生房间已凉，白烧代理额度）
+// 扫「所有有房间的人」，**包含荣誉毕业生**。
+// 🔴 2026-10-31 修正：以前把 29 位荣誉毕业生排除在外（理由是「房间已凉」），
+//    但他们房间里照样有人送「弦月回响」——活动期每天都在给红蓝榜送分，
+//    排除就等于这部分永远查不到、永远补不回来（xox 榜上他们的分我们一直是 0）。
+//    多扫 29 个房间只多 6% 请求。
 let uids = [...catalog.values()]
-  .filter((m) => m && m.id && m.srv && m.ch && String(m.tm || '').indexOf('荣誉') < 0)
+  .filter((m) => m && m.id && m.srv && m.ch)
   .map((m) => Number(m.id));
 if (process.env.ONLY_UIDS) {
   const want = new Set(String(process.env.ONLY_UIDS).split(',').map((s) => Number(s.trim())).filter(Boolean));

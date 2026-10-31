@@ -14,8 +14,8 @@ on:
   workflow_dispatch:
     inputs:
       pages:
-        description: '每个房间最多翻几页（一页 50 条）'
-        default: '2'
+        description: '每个房间最多翻几页（一页 50 条；翻到上轮游标就早停）'
+        default: '12'
       conc:
         description: '并发数'
         default: '14'
