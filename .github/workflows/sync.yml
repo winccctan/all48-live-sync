@@ -89,6 +89,12 @@ jobs:
   # 直播间送礼**不进房间 IM**，只在每场直播结束后的弹幕 LRC 里（getLiveOne → msgFilePath）。
   # 所以这个 job 天然滞后到「这场播完」，不像房间侧那样准实时。
   # 独立 job：单场 LRC 可能有几万行，慢一点也不会影响另外两个 job。
+  #
+  # 🔴 LG_RESCAN_HOURS（2026-10-31 加）：最近 6 小时开播的场次**无视已扫标记全部重扫**。
+  #    回放 LRC 是完整弹幕（实测一场 987 行 / 232 分钟 / 51 条礼物），而实时链路
+  #    （live-sse-sync）掉线时那段礼物只在 LRC 里；快扫 backfill-live-gift.mjs 又会
+  #    「SSE 从头覆盖就跳过」，两边一凑 ⇒ SSE 中间断线就等于永久丢分。
+  #    重扫幂等（t = ctime + 弹幕偏移，worker 侧精确 + 模糊双去重），实测 added=0 不虚增。
   livegift:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -108,4 +114,6 @@ jobs:
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
-          LG_MAX: '25'
+          LG_MAX: '45'
+          LG_RESCAN_HOURS: '6'
+          LG_CONC: '3'

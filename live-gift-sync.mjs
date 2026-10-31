@@ -147,7 +147,29 @@ const all = await listLives();
 // ALL_FORCE=1：无视「已扫过」游标，把 SINCE 之后的所有场次重扫一遍
 // （补鸡腿榜历史时用；重扫只会产生相同去重键，站点侧不会重复计分）
 const FORCE = process.env.ALL_FORCE === '1';
-let cands = all.filter((x) => x.ctime >= SINCE && x.ctime < UNTIL && (FORCE || !lives[x.liveId]));
+/* 🔴 LG_RESCAN_HOURS（2026-10-31）：把「最近 N 小时开播」的**已扫**场次也重扫一遍。
+   起因：直播侧的实时链路（live-sse-sync）中途掉线时，那一段礼物只存在于回放 LRC 里；
+   而快扫 backfill-live-gift.mjs 对「SSE 从头覆盖」的场次是**直接跳过不扫 LRC** 的
+   ⇒ SSE 中间断了 40 分钟，这 40 分钟的直播分就没人补，且永远补不回来。
+   实测回放 LRC 是**完整弹幕**（2026-10-31 验：某场 987 行 / 覆盖 232 分钟 / 51 条礼物；
+   当天 60 场共 128 条弦月回响，与实时侧 126 条基本一一对应），
+   重扫天然幂等：t = ctime + 弹幕偏移，worker 侧按 t|sid|mid|gid|num|src + 模糊去重。
+   ⇒ 15 分钟一轮的全量核对把最近 6 小时全扫一遍，SSE 断多久都能补回。
+   （默认 0 = 关闭，保持日常行为不变；由 sync.yml 的 livegift job 设 6）*/
+const RESCAN_H = Math.max(0, Number(process.env.LG_RESCAN_HOURS || 0));
+const rescanFloor = RESCAN_H ? Date.now() - RESCAN_H * 3600e3 : 0;
+const inRange = (x) => x.ctime >= SINCE && x.ctime < UNTIL;
+let cands;
+if (FORCE) {
+  cands = all.filter(inRange);
+} else {
+  const unseen = all.filter((x) => inRange(x) && !lives[x.liveId]);
+  const rescans = rescanFloor
+    ? all.filter((x) => inRange(x) && lives[x.liveId] && x.ctime >= rescanFloor)
+    : [];
+  if (rescans.length) log(`重扫窗口 ${RESCAN_H}h：已扫但仍在窗口内的 ${rescans.length} 场一并核对`);
+  cands = [...unseen, ...rescans];   // 未扫的优先，剩余名额给近期重扫（both 倒序）
+}
 /* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
    每轮都只重扫「最新的 MAX 场」，10-24 下午那批永远轮不到
    （2026-10-25 实测：10-24 22:00 之前的 room=2 一条都没有，就是这个原因）。
