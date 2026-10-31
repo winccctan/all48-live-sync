@@ -162,13 +162,10 @@ try {
   log('读补充名册失败（不影响本轮）：' + String(e.message).slice(0, 80));
 }
 
-// 扫「所有有房间的人」，**包含荣誉毕业生**。
-// 🔴 2026-10-31 修正：以前把 29 位荣誉毕业生排除在外（理由是「房间已凉」），
-//    但他们房间里照样有人送「弦月回响」——活动期每天都在给红蓝榜送分，
-//    排除就等于这部分永远查不到、永远补不回来（xox 榜上他们的分我们一直是 0）。
-//    多扫 29 个房间只多 6% 请求。
+// 只扫「有房间、且不是荣誉毕业生」的人。
+// 🔴 2026-10-31 站长定：荣誉毕业生不参加活动，**不要扫**（扫了纯烧请求额度）。
 let uids = [...catalog.values()]
-  .filter((m) => m && m.id && m.srv && m.ch)
+  .filter((m) => m && m.id && m.srv && m.ch && String(m.tm || '').indexOf('荣誉') < 0)
   .map((m) => Number(m.id));
 if (process.env.ONLY_UIDS) {
   const want = new Set(String(process.env.ONLY_UIDS).split(',').map((s) => Number(s.trim())).filter(Boolean));
