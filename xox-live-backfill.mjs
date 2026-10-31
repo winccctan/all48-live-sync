@@ -501,8 +501,11 @@ async function main() {
     const allAdd = [];
     const report = [];
     const pendingCache = [];   // 本轮判出缺口的人：等 ingest 回来才知道到底进没进库
-    /** 软预算：别等 GitHub 硬砍（硬砍会丢掉还没 ingest 的一批）。留 3 分钟给收尾上报。 */
-    const DEADLINE = t0 + 21 * 60000;
+    /** 软预算：别等 GitHub 硬砍（硬砍会丢掉还没 ingest 的一批）。留 2~3 分钟给收尾上报。
+     *  🔴 2026-10-31 起 workflow timeout 从 25 分钟收到 10 分钟，把这条通道做成「准实时」：
+     *     SSE 只有 72 路容量，直播高峰一定有几场覆盖不到，只有 xox 能反映「直播进行中」。
+     *     现在每 12 分钟就能对一次账（缺口人少时整轮几秒），用户几乎看不到中间的空档。 */
+    const DEADLINE = t0 + 7 * 60000;
 
     async function run() {
       for (;;) {
