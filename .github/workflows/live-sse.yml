@@ -25,7 +25,7 @@ on:
         default: '330'
       shards:
         description: '分片数（= 并发 job 数，每个 job 约 6 路）'
-        default: '10'
+        default: '7'
   schedule:
     - cron: '7 */6 * * *'
 
@@ -38,10 +38,12 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false
-      max-parallel: 10
+      max-parallel: 7
       matrix:
-        # GitHub Actions 的 matrix 需要静态值，10 片够覆盖 60 个在播场次
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        # GitHub Actions 的 matrix 需要静态值；7 片 × 6 路 = 42 个在播场次，够用。
+        # 🔴 2026-10-31 从 10 片降到 7：10 片常驻 5.5 小时会把 GitHub 免费并发（20）吃光，
+        #    红蓝快扫每 2 分钟拨一次却一直排队被取消 ⇒ 红蓝分数补不上。
+        shard: [0, 1, 2, 3, 4, 5, 6]
     concurrency:
       group: live-sse-${{ matrix.shard }}
       cancel-in-progress: false
@@ -54,7 +56,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: 消费弹幕流（分片 ${{ matrix.shard }}/10）
+      - name: 消费弹幕流（分片 ${{ matrix.shard }}/7）
         run: node live-sse-sync.mjs
         env:
           SITE_URL: ${{ vars.SITE_URL }}
