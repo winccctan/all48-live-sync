@@ -121,7 +121,13 @@ async function xoxPost(path, obj) {
         body,
       });
       if (!r.ok) throw new Error('HTTP ' + r.status);
-      const j = await r.json();
+      /* 🔴 先读文本再 JSON.parse：参数名写错时 xox 回的是**空响应体**，
+         直接 r.json() 只会抛一个 `Unexpected end of JSON input`，
+         看不出「其实是参数错了」——2026-10-31 就是因此静默失败了好几天。 */
+      const txt = await r.text();
+      if (!txt.trim()) throw new Error('空响应（多半是参数名不对）');
+      let j;
+      try { j = JSON.parse(txt); } catch (e) { throw new Error('非 JSON 响应：' + txt.slice(0, 80)); }
       if (Number(j.error) !== 0) throw new Error('xox error=' + j.error + ' ' + (j.msg || ''));
       return j;
     } catch (e) {
@@ -183,8 +189,17 @@ function makeResolver(roster) {
 async function xoxRows(cyId, src) {
   const out = [];
   const type = src === 1 ? '1' : '2';
+  /* 🔴 2026-10-31 实测：日期参数名是 **sdate / edate**。
+     用旧的 start/end 会得到一个 **空响应体**（不是报错，也不是 count=0），
+     xoxPost 里 `r.json()` 直接抛 SyntaxError → 重试 5 次 → 整轮对账失败。
+     表现就是「红蓝榜一直少分，但对账日志只有一行失败」，很难看出来。
+     另外实测：xox 的明细只保留最近 104 条（约当日起），日期参数基本不影响返回量，
+     所以这里取「今天往前 3 天」的窗口，够覆盖一天的对账缺口。 */
+  const bj = (ms) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
+  const sdate = bj(SINCE - 3 * 86400e3);
+  const edate = bj(Date.now() + 86400e3);
   for (let page = 1; page <= 40; page++) {
-    const j = await xoxPost('/Hl/detail', { cy_id: cyId, start: '2026-10-20', end: '2026-12-31', type, page });
+    const j = await xoxPost('/Hl/detail', { cy_id: cyId, sdate, edate, type, page });
     const d = j.data || {};
     const arr = Array.isArray(d.list) ? d.list : [];
     for (const r of arr) {
@@ -463,17 +478,35 @@ async function main() {
     if (ONLY) list = list.filter((x) => String(x.nickname || '').includes(ONLY));
     // 只处理「这一路还有分」的成员
     list = list.filter((x) => Number(x[field] || 0) > 0);
-    log(`\n---- ${SRC_NAME(src)}侧：候选 ${list.length} 人 ----`);
-    if (!list.length) continue;
 
     const mineIndex = await fetchAll(src);
+    /* 🔴🔴 按「xox 报的 − 我们已有的」**从大到小**排，别再按名册顺序。
+       2026-10-31 事故：workflow 每轮 25 分钟就被 timeout 砍掉，而每轮都从 list[0] 开始，
+       于是**排在后面的人永远轮不到**——秦箐忆直播侧缺 132 分（31 条）连续几轮没补上，
+       站长看到的就是「红蓝又丢数据了」。同一个病 2026-10-26 也犯过一次（阙佳慧差 70 分）。
+       按缺口排序后：
+         · 没人缺分的静默期，这里一个候选都不剩，整轮只有 rank + liveall 两个请求（几秒）；
+         · 真有人缺分，缺得最多的排最前，一轮之内必然被处理到。
+       注意 mineIndex 必须在排序**之前**取，否则没法算缺口。 */
+    const gapOf = (x) => {
+      const uid = Number(x.cy_id) || 0;
+      const mineSum = (mineIndex.get(uid) || []).reduce((a, b) => a + (Number(b.num) || 0), 0);
+      return (Number(x[field]) || 0) - mineSum;
+    };
+    list = list.filter((x) => gapOf(x) > 0).sort((a, b) => gapOf(b) - gapOf(a));
+    log(`\n---- ${SRC_NAME(src)}侧：候选 ${list.length} 人${list.length ? '（缺口最大的：' + String(list[0].nickname || '') + ' 缺 ' + gapOf(list[0]) + '）' : ''} ----`);
+    if (!list.length) continue;
+
     let idx = 0;
     const allAdd = [];
     const report = [];
     const pendingCache = [];   // 本轮判出缺口的人：等 ingest 回来才知道到底进没进库
+    /** 软预算：别等 GitHub 硬砍（硬砍会丢掉还没 ingest 的一批）。留 3 分钟给收尾上报。 */
+    const DEADLINE = t0 + 21 * 60000;
 
     async function run() {
       for (;;) {
+        if (Date.now() > DEADLINE) return;
         const i = idx++;
         if (i >= list.length) return;
         const x = list[i];
