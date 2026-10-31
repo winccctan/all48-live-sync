@@ -63,7 +63,18 @@ const START_PER_MIN = Math.max(1, Number(process.env.START_PER_MIN || 12));
 //    第 7 条 start 直接 429，冷却多久都没用；而**已经建过会话的房间重连（reused）不吃配额**。
 //    ⇒ 想覆盖更多直播间只能靠「多出口分片」：每个实例负责 liveId % SHARDS == SHARD 的那一片，
 //      每片控制在 6 个以内。GitHub Actions 的每个 job 是独立 runner（独立 IP），天然可以分摊。
-const SHARDS = Math.max(1, Number(process.env.SHARDS || 1));
+// 🔴🔴 2026-10-31 事故：workflow 的 matrix 从 10 片改成 7 片，但 env 里 SHARDS 还写着 10。
+//    于是 `hash % 10` 落在 7/8/9 的直播间**没有任何 job 负责**（实测 53 场在播里有 13 场、
+//    约 24% 完全空白）。秦箐忆 10-31 18:36–20:12 的直播红蓝分就是这么整段丢的，
+//    表现为「榜上少 132 分，补一次又对」。
+//    ⇒ 现在 workflow 用 `strategy.job-total` 自动传，并且这里对空值/非法值**直接退出**，
+//      宁可这一个 job 失败（Actions 上立刻红），也不要静默降级成 1 片去和别的 job 抢同一批房间。
+const SHARDS_RAW = process.env.SHARDS == null ? '' : String(process.env.SHARDS).trim();
+if (SHARDS_RAW !== '' && !/^[1-9]\d*$/.test(SHARDS_RAW)) {
+  console.error(`SHARDS 必须是正整数，收到 "${SHARDS_RAW}"（多半是 workflow 里表达式没渲染出来）`);
+  process.exit(2);
+}
+const SHARDS = Math.max(1, Number(SHARDS_RAW || 1));
 const SHARD = Math.min(SHARDS - 1, Math.max(0, Number(process.env.SHARD || 0)));
 // 🔴 别用 `Number(liveId) % SHARDS`：口袋48 的 liveId **末位永远是偶数**
 //    （1320895340900847616 / 1320889448901971968 …），%10 只会落在 0/2/4/6/8，

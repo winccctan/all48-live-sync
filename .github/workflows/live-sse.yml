@@ -25,7 +25,7 @@ on:
         default: '330'
       shards:
         description: '分片数（= 并发 job 数，每个 job 约 6 路）'
-        default: '7'
+        default: '9'
   schedule:
     - cron: '7 */6 * * *'
 
@@ -38,12 +38,18 @@ jobs:
     timeout-minutes: 355
     strategy:
       fail-fast: false
-      max-parallel: 7
+      max-parallel: 9
       matrix:
-        # GitHub Actions 的 matrix 需要静态值；7 片 × 6 路 = 42 个在播场次，够用。
-        # 🔴 2026-10-31 从 10 片降到 7：10 片常驻 5.5 小时会把 GitHub 免费并发（20）吃光，
+        # GitHub Actions 的 matrix 需要静态值。9 片 × 6 路 = 54 个在播场次
+        # （2026-10-31 实测同时在播 53 场，之前 7 片 × 7 路只有 42~49，黄金时段必漏）。
+        # 🔴 2026-10-31 从 10 片降到 7：10 片常驻会把 GitHub 免费并发（20）吃光，
         #    红蓝快扫每 2 分钟拨一次却一直排队被取消 ⇒ 红蓝分数补不上。
-        shard: [0, 1, 2, 3, 4, 5, 6]
+        #    后来年报回补已下线，并发腾出来了，回到 9 片。
+        # 🔴🔴 改这里**必须**同步下面的 SHARDS —— 但现在它读 strategy.job-total，自动跟着走。
+        #    2026-10-31 就是因为 matrix 改成 7 而 SHARDS 还写死 10，
+        #    导致 hash%10 ∈ {7,8,9} 的直播间**永远没有实例去连**（约 24% 场次整场空白，
+        #    秦箐忆 10-31 18:36–20:12 的红蓝直播分就是这么丢的）。
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8]
     concurrency:
       group: live-sse-${{ matrix.shard }}
       cancel-in-progress: false
@@ -56,15 +62,19 @@ jobs:
         with:
           node-version: '22'
 
-      - name: 消费弹幕流（分片 ${{ matrix.shard }}/7）
+      - name: 消费弹幕流（分片 ${{ matrix.shard }}/${{ strategy.job-total }}）
         run: node live-sse-sync.mjs
         env:
           SITE_URL: ${{ vars.SITE_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           RUN_MINUTES: ${{ inputs.minutes || '330' }}
-          SHARDS: '10'
+          # 🔴 用 strategy.job-total 而不是写死数字：matrix 加/减片时自动跟随。
+          #    写死过一次（matrix 7 而 SHARDS=10），结果 30% 的 hash 分片没人负责。
+          SHARDS: ${{ strategy.job-total }}
           SHARD: ${{ matrix.shard }}
-          MAX_ROOMS: '7'
+          # 🔴 6 是硬限：同一出口 IP 第 7 条流 start 必 429（等多久都没用）。
+          #    之前写 7，多出来的那个房间会一直卡在 wait 白白占用名额。
+          MAX_ROOMS: '6'
           START_PER_MIN: '10'
           GAP_MS: '7000'
 
