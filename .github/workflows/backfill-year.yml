@@ -1,0 +1,96 @@
+# 年报回补：把 2026 年「能补的历史」一次性灌进 lv:all
+# =====================================================================
+# 背景（2026-10-31 实测）：粉丝年报要「一整年」，但三条数据线的可回溯深度不一样：
+#   · 房间礼物（room=1）：口袋48 房间 IM 能无限往回翻 ⇒ 可补 1/1 起
+#   · 直播礼物（room=2）：录播 LRC 的礼物播报**从 2026-04-30 才开始写** ⇒ 只能补 5/1 起
+#   · 公演礼物（room=3）：公演回放没有弹幕文件，48fan 只有实时 SSE ⇒ 只能补 10/24 起（已在库里）
+# 所以本工作流只补 room=1 全年 + room=2 的 5–10 月。
+#
+# 为什么跑 Actions：房间侧整团往回翻一年，热门成员单房间 ~5000 页（0.4s/页），
+# 单机要 8–14 小时，还怕休眠断线；这里按 uid 取模切成 20 片并行。
+# 站点侧 `/api/lv/all` 按 t|mid|g|num|room 去重 ⇒ 重跑幂等，不怕重复触发。
+#
+# 🔴 runner 在海外，口袋48 对海外 IP 403 ⇒ 必须走 SCRAPE_PROXY（与 lv.yml 同）。
+name: 年报回补（2026 全年）
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '跑哪部分：room / live / both'
+        default: 'room'
+  # 本地没有 gh 登录，靠 push 这个文件来启动（push 只跑 room 侧）
+  push:
+    paths:
+      - 'trigger-backfill-year'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-year
+  cancel-in-progress: false
+
+jobs:
+  room:
+    name: 房间侧（全年，room=1）
+    if: ${{ github.event_name == 'push' || (inputs.mode || 'both') != 'live' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 回补房间礼物（1/1 → 现在）
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          SINCE: '2026-01-01T00:00:00+08:00'
+          PAGES: '9000'
+          CONC: '2'
+          SHARD: ${{ matrix.shard }}
+          SHARDS: '20'
+        run: node backfill-room-history.mjs
+
+  live:
+    name: 直播侧（${{ matrix.from }} → ${{ matrix.to }}，room=2）
+    if: ${{ github.event_name != 'push' && (inputs.mode || 'both') != 'room' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - { from: '2026-05-01', to: '2026-05-31' }
+          - { from: '2026-06-01', to: '2026-06-30' }
+          - { from: '2026-07-01', to: '2026-07-31' }
+          - { from: '2026-08-01', to: '2026-08-31' }
+          - { from: '2026-09-01', to: '2026-09-30' }
+          - { from: '2026-10-01', to: '2026-10-23' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 逐场下载回放弹幕并计价
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          ALL: '1'
+          ALL_FORCE: '1'          # 历史场次当初没留全礼物，强制重扫
+          LG_SINCE: ${{ matrix.from }}
+          LG_UNTIL: ${{ matrix.to }}
+          LG_MAX: '4000'
+          LG_PAGES: '400'         # 每页 20 场，400 页足够翻到 5 月
+        run: node live-gift-sync.mjs

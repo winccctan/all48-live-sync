@@ -46,6 +46,10 @@ function dayStr(ms) {
 }
 const SINCE_DAY = process.env.LG_SINCE || dayStr(Date.now() - 3 * 86400000);
 const SINCE = Date.parse(SINCE_DAY + 'T00:00:00+08:00');
+/* 回补历史时按「时间窗口」切片用：只扫 UNTIL 之前开的场（默认不限）。
+   与 LG_SINCE 配对成一个月的窗口，多个 job 并行互不重叠。 */
+const UNTIL_DAY = process.env.LG_UNTIL || '';
+const UNTIL = UNTIL_DAY ? Date.parse(UNTIL_DAY + 'T00:00:00+08:00') + 86400000 : Infinity;
 
 /* ---------- ① 站点配置 + 已扫场次 ---------- */
 let cfg = { name: '弦月回响', ids: [] };
@@ -103,7 +107,10 @@ function memberUid(target) {
 async function listLives() {
   const out = new Map();
   let next = '0';
-  for (let page = 0; page < 8; page++) {
+  // 🔴 补历史（LG_SINCE 往前推很多天）时 8 页远远不够：每页 20 场，8 页只 160 场，
+  //    而活动期一天就有 100+ 场。LG_PAGES 可调（默认 8 保持日常行为不变）。
+  const PAGES = Math.max(1, Number(process.env.LG_PAGES || 8));
+  for (let page = 0; page < PAGES; page++) {
     let r;
     try {
       r = await postJson('/live/api/v1/live/getLiveList', { debug: true, next: String(next), record: true }, { token: TOKEN, retries: 2 });
@@ -140,7 +147,7 @@ const all = await listLives();
 // ALL_FORCE=1：无视「已扫过」游标，把 SINCE 之后的所有场次重扫一遍
 // （补鸡腿榜历史时用；重扫只会产生相同去重键，站点侧不会重复计分）
 const FORCE = process.env.ALL_FORCE === '1';
-let cands = all.filter((x) => x.ctime >= SINCE && (FORCE || !lives[x.liveId]));
+let cands = all.filter((x) => x.ctime >= SINCE && x.ctime < UNTIL && (FORCE || !lives[x.liveId]));
 /* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
    每轮都只重扫「最新的 MAX 场」，10-24 下午那批永远轮不到
    （2026-10-25 实测：10-24 22:00 之前的 room=2 一条都没有，就是这个原因）。
@@ -165,16 +172,19 @@ const newLives = {};
 const seenGiftNames = {};
 let scanned = 0, hit = 0, noLrc = 0, unmatched = {}, linesTotal = 0;
 
-for (const lv of todo) {
+/* 🔴 补历史（2761 场）时串行只有 ~12 场/分钟，要 4 小时。LG_CONC 并行化；
+   日常 cron 仍是 1（保持原来行为，避免给口袋48 加压）。 */
+const CONC = Math.max(1, Number(process.env.LG_CONC || 1));
+async function scanOne(lv) {
   let url = '';
   try {
     const d = await postJson('/live/api/v1/live/getLiveOne', { liveId: lv.liveId }, { token: TOKEN, retries: 1 });
     url = ((d && d.content) || {}).msgFilePath || '';
   } catch (e) {
     log(`  ✗ ${lv.liveId} ${lv.nick} getLiveOne 失败 ${String(e.message).slice(0, 60)}`);
-    continue;
+    return;
   }
-  if (!url) { noLrc++; log(`  – ${lv.liveId} ${lv.nick} 没有弹幕文件（可能还在播）`); continue; }
+  if (!url) { noLrc++; log(`  – ${lv.liveId} ${lv.nick} 没有弹幕文件（可能还在播）`); return; }
 
   let text = '';
   try {
@@ -183,7 +193,7 @@ for (const lv of todo) {
     text = await res.text();
   } catch (e) {
     log(`  ✗ ${lv.liveId} ${lv.nick} 弹幕下载失败 ${String(e.message).slice(0, 60)}`);
-    continue;
+    return;
   }
   const lines = text ? text.split('\n') : [];
   linesTotal += lines.length;
@@ -218,6 +228,19 @@ for (const lv of todo) {
   // 行数太少说明弹幕还没写完，先不记游标，下一轮重扫
   if (lines.length >= 50) newLives[lv.liveId] = lv.ctime;
   log(`  ${target ? '🎁' : '  '} ${dayStr(lv.ctime)} ${lv.liveId} ${lv.nick} 行 ${lines.length} 礼物 ${got} → 「${cfg.name}」${target}`);
+}
+
+if (CONC === 1) {
+  for (const lv of todo) await scanOne(lv);
+} else {
+  let cur = 0;
+  await Promise.all(Array.from({ length: CONC }, async () => {
+    for (;;) {
+      const i = cur++;
+      if (i >= todo.length) return;
+      await scanOne(todo[i]);
+    }
+  }));
 }
 
 log(`\n扫描 ${scanned} 场 | 弹幕 ${linesTotal} 行 | 命中「${cfg.name}」${hit} 条`);
