@@ -38,7 +38,7 @@ const SITE = (process.env.SITE_URL || '').replace(/\/+$/, '');
 const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const CONC = Math.max(1, Number(process.env.CONC || 6));
-const PAGES = Math.max(1, Number(process.env.GIFT_PAGES || 12));
+const PAGES = Math.max(1, Number(process.env.GIFT_PAGES || 20));   // 2026-11-06：12→20，房间一吵 600 条两分钟就翻完了
 const MAX_MEMBERS = Number(process.env.MAX_MEMBERS || 600);
 const PAGE_LIMIT = 50;      // 实测上限就是 50，传更大没有意义
 const DRY = !!process.env.DRY;
@@ -197,6 +197,12 @@ async function memberWorker() {
     let next = 0;
     let oldest = Infinity;
     let got = 0;
+    /* covered = 本轮是否真的翻到了「上一轮扫过的位置」。
+       🔴 2026-11-06：这个标记是必须的。原来只要 oldest > since 就把游标推到 oldest，
+          隐含假设是「一轮一定翻得到 since」。房间一吵（2 分钟刷满 12 页 = 600 条）就翻不到，
+          游标直接跨过中间那段 ⇒ **永久漏**。实测阙佳慧 11-05 23:09 那条 3 分就是这么丢的，
+          对官方榜少 3 分。⇒ 没翻到就**不推进游标**，下一轮从最新重复扫（worker 精确键去重兜底）。 */
+    let covered = !since;
     try {
       for (let p = 0; p < PAGES; p++) {
         const r = await fetchMessagePage({
@@ -223,19 +229,23 @@ async function memberWorker() {
           items.push(g);
         }
         // 已经翻到「上轮扫过的位置」就不用再往前了
-        if (since && oldest <= since) break;
+        if (since && oldest <= since) { covered = true; break; }
         if (!r.nextTime || String(r.nextTime) === '0' || String(r.nextTime) === String(next)) break;
         next = r.nextTime;
       }
       if (!got) emptyCount++;
       else okCount++;
-      // 游标只推进到「实际扫到的最旧一条」，房间太吵没扫完也不会把中间那段永久跳过。
+      // 游标只推进到「实际扫到的最旧一条」，且**必须确认这一轮确实翻到了 since**
+      // （见上面 covered 的说明：没翻到就原地不动，宁可重复扫也不跨段）。
       // 🔴 2026-10-26：再夹一道 now —— 只要游标被写成未来时间，之后所有真实消息都会
       //    被 `g.t <= since` 跳过，抓取每轮 success 却一条不进（红蓝歌会整段停更）。
-      if (oldest !== Infinity && oldest > since) {
+      if (oldest !== Infinity && oldest > since && covered) {
         const cap = Date.now();
         newCur[uid] = Math.min(oldest, cap);
         if (oldest > cap + 60000) log(`  ⚠️ ${m.n || uid} 消息时间在未来（${new Date(oldest).toISOString()}），已夹到当前时间`);
+      } else if (oldest !== Infinity && oldest > since && !covered) {
+        // 没翻到上轮位置：游标不动（保持 since），下一轮重扫；这是「房间太吵翻不完」的信号
+        if (uids.length <= 30) log(`  ⏳ ${m.n || uid} 一轮没翻到上轮位置（最早 ${new Date(oldest).toISOString()}），游标不动`);
       }
     } catch (e) {
       errCount++;
