@@ -110,6 +110,19 @@ log(`核对完成：正常 ${ok.length} · 要修 ${fixes.length} · 变了但�
 for (const f of fixes) log(`  ⟳ ${f.n}(${f.id}) ${f.g}/${f.tm}  ${f.srv0}/${f.ch0} → ${f.srv}/${f.ch}  新房间 ${f.msgs} 条`);
 for (const f of moved) log(`  · ${f.n}(${f.id}) 名册 ${f.srv0}/${f.ch0} → jump ${f.srv}/${f.ch}（新房间也空，不动）`);
 
+/* 🔴 防「假成功」：口袋里 token 过期 / 出口 IP 被拦时，jump 会全抛异常或全返回空，
+   脚本会一路跑到「没有要修的，收工」然后 success —— 等于这条体检通道静默死掉，
+   正是林舒晴这种事故最怕的形态。所以异常比例过高就直接判失败，让 Actions 变红。 */
+const total = targets.length;
+if (total && failed.length + gone.length > total * 0.9) {
+  console.error(
+    `✖ 异常：${failed.length} 个失败 + ${gone.length} 个拿不到房间 = ${failed.length + gone.length}/${total}，` +
+    '疑似 POCKET48_TOKEN 失效或出口被拦，本轮结果不可信'
+  );
+  if (failed.length) console.error('  首个错误：' + JSON.stringify(failed[0]).slice(0, 200));
+  process.exit(2);
+}
+
 /* ------------------------------------------------------------ ③ 推修复行 */
 if (!fixes.length) {
   log('没有要修的，收工');
