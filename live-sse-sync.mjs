@@ -189,14 +189,24 @@ async function attach(room) {
   //    省下的配额留给真正需要新建会话的房间。
   if (room.sessionOk && room.clientId) {
     room.state = 'connecting';
-    try {
-      await consume(room, room.clientId);
-      return;
-    } catch (e) {
+    // 🔴🔴 这里**绝对不能 await**：一条 SSE 要挂 185 秒，await 住的话
+    //    connectTick 的「建连节拍」就被这一个房间独占 185 秒，同片其它房间
+    //    在这段时间里既连不上、掉线了也重连不了。
+    //    2026-11-08 实测：靠 sessionOk 复用的都是「刚跑满 185 秒主动断开」的房间，
+    //    也就是每片每 3 分钟必然踩一次 ⇒ 分片被串行化成「一次只看一个房间」，
+    //    整场直播的实时覆盖率掉到 10%~20%，剩下的全靠直播结束后读回放弹幕补。
+    //    start 分支（下面那处）早就不 await 了，这里之前漏了。
+    consume(room, room.clientId).catch((e) => {
       const msg = String((e && e.message) || e);
-      if (!/sse (401|403)/.test(msg)) { onStreamEnd(room, e); return; }
-      room.sessionOk = false;   // 会话真没了，下面走 start
-    }
+      if (/sse (401|403)/.test(msg)) {
+        room.sessionOk = false;   // 会话真没了 → 下次走 start 重建
+        room.state = 'dead';
+        room.nextTryAt = Date.now() + 2000;
+        return;
+      }
+      onStreamEnd(room, e);
+    });
+    return;
   }
 
   if (!takeToken()) { room.state = 'wait'; return; }   // 本分钟额度用完，下一轮继续，别硬撞出 429
@@ -211,8 +221,10 @@ async function attach(room) {
     // reused=true 说明会话本来就在，48fan 不把它当新建 ⇒ 把令牌退回来
     if (s.reused) bucket.tokens = Math.min(START_PER_MIN, bucket.tokens + 1);
     room.sessionOk = true;
-    // 只有「开播后 5 分钟内就连上」才算从头覆盖，才敢让 LRC 补抓跳过这场
-    if (!covered.has(room.liveId) && room.coverable) covered.set(room.liveId, Date.now());
+    // 只有「开播后 90 秒内就连上」才算从头覆盖，才敢让 LRC 补抓跳过这场。
+    // 🔴 拿到 startMs 就必须按建连时刻重算（见 scan() 里的注释），90 秒是重连/抖动余量。
+    const fresh = room.startMs && (Date.now() - room.startMs) <= 90000;
+    if (!covered.has(room.liveId) && fresh) covered.set(room.liveId, Date.now());
     // 🔴 千万别 await consume()：SSE 会挂几个小时，await 住的话后面所有房间永远连不上（第一版就这么写的）。
     consume(room, clientId).catch((e) => onStreamEnd(room, e));
   } catch (e) {
@@ -235,10 +247,14 @@ function onStreamEnd(room, e) {
 
   const msg = String((e && e.message) || e || '流结束').slice(0, 80);
   const is429 = /429/.test(msg);
-  // 404 = 48fan 自己没在抓这个房间（不是我们的错），退避久一点别硬撞
+  // 404 = 48fan 那边这个房间的会话没了 / 瞬时抽风。
+  // 🔴 以前给 300 秒（5 分钟）的冷板凳：2026-11-08 实测 /start 的 404 是**瞬时**的
+  //    （同一个 liveId 一分钟后再要就 200），5 分钟惩罚等于「抽一次就瞎 5 分钟」，
+  //    一场 1 小时的直播被抽几次就只剩一两成实时覆盖率。改成 20 秒 + 换新 clientId 重来。
   const wait = is429 ? 30000
-    : /404/.test(msg) ? 300000
+    : /404/.test(msg) ? 20000
     : Math.min(120000, 3000 * Math.pow(1.8, Math.min(room.tries || 1, 6)));
+  if (/404/.test(msg)) room.clientId = uuid();   // 旧会话可能被对端清了，换一个再要
   if (is429) { backoffUntil = Date.now() + 30000; say(`  ⏸ 触发 429，全局冷却 30 秒`); }
   room.nextTryAt = Date.now() + wait;
   if (!is429 && ((room.tries || 0) <= 2 || (room.tries || 0) % 10 === 0)) {
@@ -435,7 +451,11 @@ async function scan() {
         liveId: x.liveId, nick: x.nick, clientId: uuid(), abort: null,
         state: 'wait', nMsg: 0, nGift: 0, lastEvAt: 0, tries: 0, nextTryAt: 0,
         sessionOk: false, softReconnect: false,
-        // 我们是不是从小就在看：开播不到 5 分钟（或拿不到开播时间就保守认为不是）
+        // 开播时间（毫秒）。🔴 登记 covered 的判定必须放在**建连那一刻**看，
+        //    不能在看列表那一刻算好：扫到它时还没到 5 分钟，等真连上可能已经过了 15 分钟
+        //    （分片排队 + 404 冷板凳），那段空白却被记成「实时覆盖过」，
+        //    于是回放补抓会跳过整场 ⇒ 前 15 分钟的礼物永久丢失（2026-11-08 发现）。
+        startMs: Number(x.startMs) || 0,
         coverable: !!x.startMs && (Date.now() - x.startMs) <= 5 * 60000,
       });
       added++;
