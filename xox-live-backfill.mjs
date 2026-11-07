@@ -84,7 +84,7 @@ function parseSince(s) {
   const t = Date.parse(s);
   return Number.isFinite(t) ? t : todayBjStart() - 24 * 3600 * 1000;
 }
-const SINCE = parseSince(process.env.SINCE);
+let SINCE = parseSince(process.env.SINCE);
 const bjDayOf = (ms) => new Date(Number(ms) + BJ).toISOString().slice(0, 10).replace(/-/g, '');
 /** "2026-10-24 23:01:27"（北京时间）→ ms */
 function parseBj(s) {
@@ -439,6 +439,23 @@ const TARGET_FIELD = (src) => (src === 1 ? 'live_vote' : 'room_vote');
 async function main() {
   const t0 = Date.now();
   if (!INGEST && !DRY) throw new Error('缺少 INGEST_TOKEN');
+  // 🔴 默认 SINCE 对齐「榜窗口起点」(/api/gift 的 from)，而非写死的「昨天」。
+  //    红蓝歌会是多日活动（窗口约 10-24~11-08），礼物跨多天。若只用「昨天」窗口，
+  //    早几天的直播/房间缺口会被 SINCE 过滤掉 → 对账静默漏补：
+  //      陈柯睿直播缺 99（xox 1011 / 我们 912）、覃柯蒙房间被虚报缺 1770
+  //      （实际站内 7754 条房间记录都在，只是窗口太窄 fetchAll/detail 都看不到）。
+  //    对齐榜窗口后，reconcile 的范围 = 榜上展示的范围，两边口径一致，缺口才补得全。
+  //    CI 走 workflow_dispatch 不传 since，就自动用这个默认（无需改 worker cron）。
+  if (!process.env.SINCE) {
+    try {
+      const g = await siteGet('/api/gift');
+      const from = String((g && g.from) || '').trim();
+      if (/^\d{8}$/.test(from)) {
+        SINCE = parseSince(from.slice(0, 4) + '-' + from.slice(4, 6) + '-' + from.slice(6, 8));
+        log(`SINCE 未指定 → 对齐榜窗口起点 ${from}（北京）`);
+      }
+    } catch (e) { log('取榜窗口起点失败，回退默认昨天：' + String(e.message).slice(0, 60)); }
+  }
   log(`=== xox48 对账补差（${SRC_LIST.map(SRC_NAME).join(' + ')}） 起算 ${new Date(SINCE + BJ).toISOString().slice(0, 19).replace('T', ' ')}（北京）· 容差 ${TOL / 60000} 分钟 ===`);
 
   const roster = await loadRoster();
