@@ -25,6 +25,8 @@
  *   LIMIT=50 CONC=6 node ...                     # 限量 / 并发
  *   MAX_PAGES=3 CONC=6 node ...                  # 只翻当天那几页（高频快扫用）
  *   node backfill-live-gift.mjs --selftest       # 离线校验 LRC 解析（无需任何网络）
+ *   WIN=1 WIN_MIN=30 WIN_MAX=70 node ...          # 窗口回收：只扫「刚结束 30~70 分钟」的场次
+ *                                                # （无视已扫游标、不排除 SSE 已覆盖场次，靠对账只补差）
  *
  * 环境变量：
  *   SITE_URL / INGEST_TOKEN / POCKET48_TOKEN / SCRAPE_PROXY
@@ -47,6 +49,28 @@ const LIMIT = Math.max(0, Number(process.env.LIMIT || 0));
 const CONC = Math.max(1, Number(process.env.CONC || 6));
 // 列表最多翻几页（高频快扫用：只要当天那几页，别每次都翻 40 页）
 const MAX_PAGES = Math.max(1, Number(process.env.MAX_PAGES || 40));
+
+// 🔴 轻量兜底（2026-11-08 站长批准）：「只扫刚结束 N 分钟」的场次，10 分钟一轮。
+// 为什么需要：直播侧的实时链路（live-sse-sync）偶发丢**聚合事件**（×99/×9 连刷、心锁 480…），
+// 那些场次被记成「SSE 已从头覆盖」⇒ 原 backfill 直接跳过不扫 LRC ⇒ 丢的礼物永远补不回来，
+// 表现就是「我们的比官方少几十分」（陈柯睿 -73 就是这种）。
+// 回放 LRC 是完整弹幕，天然幂等（t=ctime+偏移 稳定），且写前会跟站里已有的对账（reconcileRows
+// 只补真正缺的，绝不重复计分）。所以在「刚结束 40 分钟左右」这个窗口里，把 SSE 已覆盖的场次
+// 也重扫一遍 LRC、只补差，就能把丢的聚合事件捞回来，而且不会双算。
+// 窗口默认 [30,70] 分钟（中心 40），10 分钟粒度下一档场次在窗口里会停留 ~4 个 tick，
+// 足够等回放文件写完；一旦有内容就标记已扫，下一档不再处理。
+const WIN = !!process.env.WIN;
+const WIN_MIN = Math.max(0, Number(process.env.WIN_MIN || 30));   // 结束后至少多少分钟
+const WIN_MAX = Math.max(WIN_MIN, Number(process.env.WIN_MAX || 70)); // 结束后至多多少分钟
+// duration 是「时长字符串」：'09:47' 是 9 分 47 秒，'01:23:39' 是 1 小时 23 分 39 秒。
+// 别当毫秒/秒用。结束时间 = ctime + duration ⇒ 才能算「刚结束几分钟」。
+function durMs(s) {
+  const p = String(s || '').split(':').map((x) => Number(x));
+  if (!p.length || p.some((n) => !isFinite(n))) return 0;
+  let sec = 0;
+  for (const v of p) sec = sec * 60 + v;
+  return sec * 1000;
+}
 
 // 活动起点（北京）：默认「北京今天 0 点往前再退 6 小时」
 // 🔴 为什么不再写死 2026-10-24：这个脚本现在挂在 2 分钟快扫里天天跑，
@@ -191,11 +215,13 @@ async function collectSessions() {
     if (!list.length) break;
     for (const x of list) {
       const ctime = Number(x.ctime) || 0;
+      const dur = durMs(x.duration);
       all.push({
         liveId: String(x.liveId || ''),
         uid: String((x.userInfo && x.userInfo.userId) || ''),
         nick: String((x.userInfo && x.userInfo.nickname) || ''),
         ctime,
+        endMs: ctime + dur,          // duration 缺失时 = ctime（当作刚开始，不会被窗口选中）
       });
     }
     const nx = String(c.next || '0');
@@ -293,18 +319,36 @@ async function main() {
   NAME = cfg.name || '弦月回响';
   const { memberUid } = createGiftParser(cfg, roster);
 
-  const sessions = await collectSessions();
+  let sessions = await collectSessions();
+
+  // 🔴 窗口模式（WIN=1）：只扫「刚结束 N 分钟」的场次，作为 10 分钟一轮的轻量兜底。
+  //    无视已扫游标（每轮都重扫窗口内场次，靠 reconcileRows 只补差、保证幂等），
+  //    且**不排除 SSE 已覆盖场次**——那些场次正是丢聚合事件的高危对象，要捞回来。
+  if (WIN) {
+    const now = Date.now();
+    const win = sessions.filter((s) => {
+      if (!s.endMs) return false;
+      const ago = (now - s.endMs) / 60000;
+      return ago >= WIN_MIN && ago <= WIN_MAX;
+    });
+    log(`窗口模式：仅处理「结束 ${WIN_MIN}~${WIN_MAX} 分钟」的场次（命中 ${win.length} / 候选 ${sessions.length}）`);
+    sessions = win;
+  }
+
   log(`候选直播 ${sessions.length} 场（>= 起点）`);
 
-  // 待处理：未扫过（或 FORCE）且有回放文件
-  const todo = sessions.filter((s) => FORCE || !scanned[s.liveId]);
+  // 待处理：未扫过（或 FORCE / 窗口模式）且有回放文件
+  const todo = sessions.filter((s) => FORCE || WIN || !scanned[s.liveId]);
 
   // 🔴 实时已覆盖的场次跳过（2026-10-25）：直播中的礼物已由 live-sse-sync.mjs 实时上报，
   //    再扫一遍 LRC 会因为时间戳口径不同（serverTime vs ctime+偏移）被 worker 当成新记录 ⇒ 重复计分。
   //    判定：SSE 首次建连时间 <= 开播时间 + 5 分钟 ⇒ 从头就在看，可以放心跳过。
   //    中途才参与的不跳过（宁可重复也不能漏）。
+  //    ⚠️ 窗口模式（WIN=1）下**不排除**：那些场次就是丢聚合事件的高危对象，
+  //    且写前会跟站里已有的对账（reconcileRows 只补差），不会双算。
   const sseSkip = [];
   const todo2 = todo.filter((s) => {
+    if (WIN) return true;
     const first = Number(sseCovered[String(s.liveId)] || 0);
     if (!first) return true;
     const ctimeMs = Number(s.ctime) || 0;

@@ -1,0 +1,85 @@
+# 红蓝歌会 · 直播回放「刚结束窗口」回收（10 分钟兜底）
+#
+# 为什么单独开：
+#   直播侧的实时链路（live-sse-sync）偶发丢**聚合事件**（×99/×9 连刷、心锁 480…），
+#   那些场次被记成「SSE 已从头覆盖」⇒ 常规 backfill 直接跳过不扫 LRC ⇒ 丢的礼物永久补不回来，
+#   表现就是「我们的比官方少几十分」（陈柯睿 -73 即此）。
+#   回放 LRC 是完整弹幕，且写前 worker 端按 t|sid|mid|gid|num|src / lvKey 去重（幂等），
+#   所以在「刚结束 40 分钟左右」这个窗口里把近期场次重扫一遍，就能把丢的聚合事件捞回来，且不双算。
+#
+# 两条通道一起扫（同一窗口、同一批场次）：
+#   ① backfill-live-gift.mjs  WIN=1  → 红蓝歌会「弦月回响」补抓（/api/gift/ingest，src=1）
+#   ② live-gift-sync.mjs      WIN=1 ALL=1 → 全部有价礼物补抓进鸡腿榜（/api/lv/all，room=2）
+#   两者都只对窗口内场次生效，10 分钟粒度下一档场次在窗口里停留 ~4 个 tick，足够等回放写完；
+#   写前各有去重，重跑安全、不会重复计分。
+#
+# 做法：每 10 分钟跑一轮（GitHub Actions 原生 schedule，public 仓库免费）。
+name: 红蓝歌会 · 直播窗口回收
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'        # 每 10 分钟一轮（GitHub Actions 原生，public 仓库免费）
+  workflow_dispatch:
+    inputs:
+      win_min:
+        description: '只扫「结束至少 N 分钟」的场次'
+        default: '30'
+      win_max:
+        description: '只扫「结束至多 N 分钟」的场次'
+        default: '70'
+      pages:
+        description: '翻几页已结束列表（1 页 ≈ 近 20 场，增量足够）'
+        default: '3'
+      conc:
+        description: '并发数'
+        default: '6'
+
+permissions:
+  contents: read
+
+# 同一时间只允许一轮：上一轮没跑完就丢新的（脚本内置去重，重跑安全）。
+concurrency:
+  group: live-gift-win
+  cancel-in-progress: false
+
+jobs:
+  win:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: ① 回收红蓝歌会「弦月回响」（窗口模式）
+        run: node backfill-live-gift.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          GIFT_NAME: '弦月回响'
+          WIN: '1'
+          WIN_MIN: ${{ inputs.win_min }}
+          WIN_MAX: ${{ inputs.win_max }}
+          MAX_PAGES: ${{ inputs.pages }}
+          CONC: ${{ inputs.conc }}
+
+      - name: ② 回收直播侧全部有价礼物（鸡腿榜·窗口模式）
+        run: node live-gift-sync.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          ALL: '1'
+          WIN: '1'
+          WIN_MIN: ${{ inputs.win_min }}
+          WIN_MAX: ${{ inputs.win_max }}
+          LG_MAX: '120'
+          LG_PAGES: ${{ inputs.pages }}
+          LG_CONC: ${{ inputs.conc }}

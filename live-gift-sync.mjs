@@ -34,6 +34,17 @@ const INGEST = process.env.INGEST_TOKEN || '';
 const TOKEN = process.env.POCKET48_TOKEN || '';
 const MAX = Math.max(1, Number(process.env.LG_MAX || 25));
 
+// 🔴 轻量兜底（2026-11-08 站长批准）：「只扫刚结束 N 分钟」的场次，10 分钟一轮。
+// 为什么需要：直播侧实时链路（live-sse-sync）偶发丢**聚合事件**（×99/×9 连刷、心锁 480…），
+// 那些场次被记成「SSE 已从头覆盖」⇒ 原回放补抓直接跳过不扫 LRC ⇒ 丢的鸡腿/弦月回响永远补不回来，
+// 表现就是「我们的比官方少几十分」（陈柯睿 -73 即此）。
+// 回放 LRC 是完整弹幕，且写前 worker 端按 t|sid|mid|gid|num|src / lvKey 去重（幂等），
+// 所以在「刚结束 40 分钟左右」窗口里把近期场次重扫一遍、只补差，就能捞回缺失的分数，且不双算。
+// 窗口默认 [30,70] 分钟（中心 40）；10 分钟粒度下一档场次在窗口里停留 ~4 个 tick，足够等回放写完。
+const WIN = !!process.env.WIN;
+const WIN_MIN = Math.max(0, Number(process.env.WIN_MIN || 30));   // 结束后至少多少分钟
+const WIN_MAX = Math.max(WIN_MIN, Number(process.env.WIN_MAX || 70)); // 结束后至多多少分钟
+
 const log = (...a) => console.log(...a);
 const t0 = Date.now();
 
@@ -104,6 +115,15 @@ function memberUid(target) {
 }
 
 /* ---------- ③ 直播列表（只要已结束 / 有 LRC 的） ---------- */
+/* 🔴 duration 是「时长字符串」：'09:47' 是 9 分 47 秒，'01:23:39' 是 1 小时 23 分 39 秒。
+   别当毫秒/秒用。结束时间 = ctime + duration ⇒ 才能算「刚结束几分钟」。 */
+function durMs(s) {
+  const p = String(s || '').split(':').map((x) => Number(x));
+  if (!p.length || p.some((n) => !isFinite(n))) return 0;
+  let sec = 0;
+  for (const v of p) sec = sec * 60 + v;
+  return sec * 1000;
+}
 async function listLives() {
   const out = new Map();
   let next = '0';
@@ -126,11 +146,14 @@ async function listLives() {
       if (!x || !x.liveId) continue;
       const ct = Number(x.ctime || 0);
       if (ct) oldest = Math.min(oldest, ct);
+      const dur = durMs(x.duration);
       out.set(String(x.liveId), {
         liveId: String(x.liveId),
         uid: String((x.userInfo && x.userInfo.userId) || ''),
         nick: String((x.userInfo && x.userInfo.nickname) || ''),
         ctime: ct,
+        dur,
+        endMs: ct + dur,          // duration 缺失时 = ctime（当作刚开始，不会被快扫窗口选中）
         status: Number(x.status),
       });
     }
@@ -159,15 +182,32 @@ const FORCE = process.env.ALL_FORCE === '1';
 const RESCAN_H = Math.max(0, Number(process.env.LG_RESCAN_HOURS || 0));
 const rescanFloor = RESCAN_H ? Date.now() - RESCAN_H * 3600e3 : 0;
 const inRange = (x) => x.ctime >= SINCE && x.ctime < UNTIL;
+
+// 🔴 窗口模式（WIN=1）：只扫「刚结束 N 分钟」的场次，作为 10 分钟一轮的轻量兜底。
+//    无视已扫游标（每轮都重扫窗口内场次，靠 worker 端去重保证幂等），
+//    把 SSE 可能丢聚合事件的场次重扫一遍，捞回直播侧缺失的鸡腿/弦月回响。
+let base = all;
+if (WIN) {
+  const now = Date.now();
+  base = all.filter((x) => {
+    if (!x.endMs) return false;
+    const ago = (now - x.endMs) / 60000;
+    return ago >= WIN_MIN && ago <= WIN_MAX;
+  });
+  log(`窗口模式：仅处理「结束 ${WIN_MIN}~${WIN_MAX} 分钟」的场次（命中 ${base.length} / 候选 ${all.length}）`);
+}
+
 let cands;
 if (FORCE) {
-  cands = all.filter(inRange);
+  cands = base.filter(inRange);
 } else {
-  const unseen = all.filter((x) => inRange(x) && !lives[x.liveId]);
+  const unseen = base.filter((x) => inRange(x) && (WIN || !lives[x.liveId]));
   const rescans = rescanFloor
-    ? all.filter((x) => inRange(x) && lives[x.liveId] && x.ctime >= rescanFloor)
+    ? base.filter((x) => inRange(x) && lives[x.liveId] && x.ctime >= rescanFloor)
     : [];
   if (rescans.length) log(`重扫窗口 ${RESCAN_H}h：已扫但仍在窗口内的 ${rescans.length} 场一并核对`);
+  // 🔴 候选队列挤压修复（2026-11-08）：未扫场次会把「已扫待重扫」挤掉，补漏必须 ALL_FORCE=1。
+  //    窗口模式下队列本就很小（刚结束 N 分钟的场次有限），未扫优先、重扫并入，不再一刀切挤掉。
   cands = [...unseen, ...rescans];   // 未扫的优先，剩余名额给近期重扫（both 倒序）
 }
 /* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
@@ -180,7 +220,7 @@ if (FORCE) {
    ⇒ 日常取**最新**的 MAX 场（slice(-MAX)），要回填历史用 since 显式指定起点。 */
 if (FORCE) cands = cands.slice().sort((a, b) => a.ctime - b.ctime);
 const todo = FORCE ? cands.slice(-MAX) : cands.slice(0, MAX);
-log(`直播共 ${all.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
+log(`直播共 ${all.length} 场 | 本轮基集 ${base.length} 场 | ${SINCE_DAY} 之后 ${all.filter((x) => x.ctime >= SINCE).length} 场 | 本轮待扫 ${todo.length} 场`);
 
 /* ---------- ④ 逐场抽礼物 ---------- */
 const RE_TAB = /^\[(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.+?)\t\s*送给\s*(.+?)\s+(\d+)\s*个\s*(.+?)\s*$/;
