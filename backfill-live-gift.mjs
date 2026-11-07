@@ -62,6 +62,9 @@ const MAX_PAGES = Math.max(1, Number(process.env.MAX_PAGES || 40));
 const WIN = !!process.env.WIN;
 const WIN_MIN = Math.max(0, Number(process.env.WIN_MIN || 30));   // 结束后至少多少分钟
 const WIN_MAX = Math.max(WIN_MIN, Number(process.env.WIN_MAX || 70)); // 结束后至多多少分钟
+// 🔴 根治（2026-11-08）：实时已覆盖的场次不再「永久跳过」，改为「近期窗口内改走对账只补差」。
+//    详见下方 sseSkip 处。默认 6 小时（RECON_H），可用环境变量覆盖；WIN 模式的上限也会随它放宽。
+const RECON_H = Math.max(0, Number(process.env.RECON_H || 6));
 // duration 是「时长字符串」：'09:47' 是 9 分 47 秒，'01:23:39' 是 1 小时 23 分 39 秒。
 // 别当毫秒/秒用。结束时间 = ctime + duration ⇒ 才能算「刚结束几分钟」。
 function durMs(s) {
@@ -326,12 +329,13 @@ async function main() {
   //    且**不排除 SSE 已覆盖场次**——那些场次正是丢聚合事件的高危对象，要捞回来。
   if (WIN) {
     const now = Date.now();
+    const winMaxMin = Math.max(WIN_MAX, RECON_H * 60);   // RECON_H 放宽窗口上限
     const win = sessions.filter((s) => {
       if (!s.endMs) return false;
       const ago = (now - s.endMs) / 60000;
-      return ago >= WIN_MIN && ago <= WIN_MAX;
+      return ago >= WIN_MIN && ago <= winMaxMin;
     });
-    log(`窗口模式：仅处理「结束 ${WIN_MIN}~${WIN_MAX} 分钟」的场次（命中 ${win.length} / 候选 ${sessions.length}）`);
+    log(`窗口模式：仅处理「结束 ${WIN_MIN}~${winMaxMin} 分钟」的场次（命中 ${win.length} / 候选 ${sessions.length}）`);
     sessions = win;
   }
 
@@ -340,22 +344,30 @@ async function main() {
   // 待处理：未扫过（或 FORCE / 窗口模式）且有回放文件
   const todo = sessions.filter((s) => FORCE || WIN || !scanned[s.liveId]);
 
-  // 🔴 实时已覆盖的场次跳过（2026-10-25）：直播中的礼物已由 live-sse-sync.mjs 实时上报，
-  //    再扫一遍 LRC 会因为时间戳口径不同（serverTime vs ctime+偏移）被 worker 当成新记录 ⇒ 重复计分。
-  //    判定：SSE 首次建连时间 <= 开播时间 + 5 分钟 ⇒ 从头就在看，可以放心跳过。
-  //    中途才参与的不跳过（宁可重复也不能漏）。
-  //    ⚠️ 窗口模式（WIN=1）下**不排除**：那些场次就是丢聚合事件的高危对象，
-  //    且写前会跟站里已有的对账（reconcileRows 只补差），不会双算。
-  const sseSkip = [];
+  // 🔴🔴 根治（2026-11-08）：实时已覆盖的场次**不再永久跳过**。
+  //    旧逻辑（上方注释）：SSE 从头覆盖过（首次建连 <= 开播+5min）就整场跳过 LRC 回放，
+  //    理由是「时间戳口径不同会重复计分」。但代价是：SSE 偶发丢**聚合事件**
+  //    （×99/×9 连刷、心锁 480…），那些场次被记成「已覆盖」⇒ 回放兜底永远扫不到
+  //    ⇒ 聚合事件永久丢分（陈柯睿 -73 即此；「数据缺失严重」的直播侧真缺口来源之一）。
+  //    改为：只跳过「结束后已超过 RECON_H 小时」的**老**场次（确实稳定、不该重复扫）；
+  //    对「仍在 RECON_H 窗口内」的近期场次**不再跳过**，交给下方 reconcileRows（20 分钟容差）
+  //    只补真正缺的（聚合事件），绝不重复计分。扫完若确有内容就标记已扫，下一轮不再扫
+  //    ⇒ 每场最多多扫一次，成本可控，且彻底堵死「覆盖即漏」的永久丢分。
+  //    去重双保险：① 本脚本写前先跟 /api/gift/liveall 对账只补差；② worker 端
+  //    t|sid|mid|gid|num|src 精确键 + 跨通道 5 秒模糊去重（sse 与 lrc 不同通道），SSE∩LRC 不双算。
+  const now = Date.now();
+  const RECON_MS = RECON_H * 3600 * 1000;
+  const recentCovered = [];
   const todo2 = todo.filter((s) => {
-    if (WIN) return true;
+    if (WIN) return true;                       // 窗口模式：恒不跳过（高危场次重点捞）
     const first = Number(sseCovered[String(s.liveId)] || 0);
-    if (!first) return true;
-    const ctimeMs = Number(s.ctime) || 0;
-    if (first <= ctimeMs + 5 * 60000) { sseSkip.push(s.liveId); return false; }
+    if (!first) return true;                    // 没被 SSE 覆盖过 ⇒ 正常扫
+    const recent = !s.endMs || (now - s.endMs) <= RECON_MS;
+    if (!recent) return false;                  // 老场次：跳过（原行为，省流量）
+    recentCovered.push(s.liveId);               // 近期场次：交给 reconcile 只补差
     return true;
   });
-  if (sseSkip.length) log(`实时已覆盖 ${sseSkip.length} 场，跳过不重复扫`);
+  if (recentCovered.length) log(`实时已覆盖且仍在 ${RECON_H}h 窗口内 ${recentCovered.length} 场 → 改走对账只补差（不重复计分）`);
   todo.length = 0;
   todo.push(...todo2);
 

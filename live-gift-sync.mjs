@@ -206,9 +206,14 @@ if (FORCE) {
     ? base.filter((x) => inRange(x) && lives[x.liveId] && x.ctime >= rescanFloor)
     : [];
   if (rescans.length) log(`重扫窗口 ${RESCAN_H}h：已扫但仍在窗口内的 ${rescans.length} 场一并核对`);
-  // 🔴 候选队列挤压修复（2026-11-08）：未扫场次会把「已扫待重扫」挤掉，补漏必须 ALL_FORCE=1。
-  //    窗口模式下队列本就很小（刚结束 N 分钟的场次有限），未扫优先、重扫并入，不再一刀切挤掉。
-  cands = [...unseen, ...rescans];   // 未扫的优先，剩余名额给近期重扫（both 倒序）
+  // 🔴🔴 根治（2026-11-08）：预留「重扫配额」，避免高并发时未扫场次（每秒都有新场次结束
+  //    ⇒ unseen 永远填满 MAX）把「聚合事件回补」挤掉，导致早几小时的缺口永远轮不到。
+  //    默认给 MAX 的 1/3 给近期重扫；未扫优先占满剩余名额。这样无论 unseen 多大，
+  //    每个 15 分钟周期都保证有 RESCAN_QUOTA 场在做对账补差。
+  const RESCAN_QUOTA = Math.max(0, Number(process.env.LG_RESCAN_QUOTA || Math.ceil(MAX / 3)));
+  const unseenCap = unseen.slice(0, Math.max(0, MAX - RESCAN_QUOTA));
+  const rescansCap = rescans.slice(0, RESCAN_QUOTA);
+  cands = [...unseenCap, ...rescansCap];   // 未扫优先，重扫占保底配额（both 倒序）
 }
 /* 🔴 补历史（FORCE）必须**从最早往后扫**：`all` 是按 ctime 倒序的，直接 slice(0, MAX)
    每轮都只重扫「最新的 MAX 场」，10-24 下午那批永远轮不到
