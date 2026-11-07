@@ -1,0 +1,62 @@
+# 名册房间号体检（每周一次）
+#
+# 为什么（2026-11-07 站长「为啥没有抓到林舒晴的数据」）：
+#   她名册里的 ch（channelId）从 10-25 起就是 CKG 时期的老房间号（1360914），
+#   而她在口袋48 的当前房间是 1230390。抓取端每天老老实实进那个空房间翻页，
+#   一条礼物都没有 —— 表现和「她最近没活动」一模一样，10 天没人发现，丢了 21 万鸡腿。
+#
+#   名册的房间号只在手动 `sync-roster.mjs --write` 时刷新，**没有任何定时校验**；
+#   而 Actions 里改不了静态 members.js（那要重新 deploy 生产）。
+#
+# 这条通道只做一件事：用 `im/server/jump` 逐个核对当前房间号，
+# 只对「不一致、且新房间真能拉到消息」的人推一行带 fix 标记的 KV 记录
+# （POST /api/roster/extra，见 verify-rooms.mjs 与 worker 的 applyRosterExtra）。
+# 🔴 改的只有 srv/ch —— 分数、团、队一个字都不碰。
+#
+# 由站点 Worker 的 cron `13 6 * * SUN`（北京周日 14:13）拨号，也可手动 dispatch。
+name: 名册房间号体检
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry:
+        description: '1 = 只报告不推送'
+        default: ''
+      only:
+        description: '只查指定 uid（逗号分隔，留空 = 全员）'
+        default: ''
+      conc:
+        description: '并发（默认 6）'
+        default: '6'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rooms-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    # 500 个房间 jump 一轮约 3~4 分钟，留够余量
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 核对并修复房间号
+        run: node verify-rooms.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          DRY: ${{ inputs.dry }}
+          ONLY_UIDS: ${{ inputs.only }}
+          CONC: ${{ inputs.conc || '6' }}
