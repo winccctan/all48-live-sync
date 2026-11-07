@@ -189,17 +189,13 @@ function makeResolver(roster) {
 async function xoxRows(cyId, src) {
   const out = [];
   const type = src === 1 ? '1' : '2';
-  /* 🔴 2026-10-31 实测：日期参数名是 **sdate / edate**。
-     用旧的 start/end 会得到一个 **空响应体**（不是报错，也不是 count=0），
-     xoxPost 里 `r.json()` 直接抛 SyntaxError → 重试 5 次 → 整轮对账失败。
-     表现就是「红蓝榜一直少分，但对账日志只有一行失败」，很难看出来。
-     另外实测：xox 的明细只保留最近 104 条（约当日起），日期参数基本不影响返回量，
-     所以这里取「今天往前 3 天」的窗口，够覆盖一天的对账缺口。 */
-  const bj = (ms) => new Date(ms + 8 * 3600e3).toISOString().slice(0, 10);
-  const sdate = bj(SINCE - 3 * 86400e3);
-  const edate = bj(Date.now() + 86400e3);
+  /* 🔴🔴 2026-11-08 修：/Hl/detail **不能带任何日期参数**（sdate/edate 一传就回空 body，
+     表现就是「rank 能拉到、detail 永远空响应 → 对账静默失败、红蓝榜持续少分」）。
+     之前 2026-10-31 为绕开 start/end 改成 sdate/edate，现在 xox 反过来：带日期就崩。
+     去掉日期后 detail 正常返回（最多约 104 条当日起记录），本地再按 SINCE 过滤即可，
+     与「日期参数基本不影响返回量」的结论一致。 */
   for (let page = 1; page <= 40; page++) {
-    const j = await xoxPost('/Hl/detail', { cy_id: cyId, sdate, edate, type, page });
+    const j = await xoxPost('/Hl/detail', { cy_id: cyId, type, page });
     const d = j.data || {};
     const arr = Array.isArray(d.list) ? d.list : [];
     for (const r of arr) {
@@ -505,7 +501,8 @@ async function main() {
      *  🔴 2026-10-31 起 workflow timeout 从 25 分钟收到 10 分钟，把这条通道做成「准实时」：
      *     SSE 只有 72 路容量，直播高峰一定有几场覆盖不到，只有 xox 能反映「直播进行中」。
      *     现在每 12 分钟就能对一次账（缺口人少时整轮几秒），用户几乎看不到中间的空档。 */
-    const DEADLINE = t0 + 7 * 60000;
+    /** 🔴 软预算：本地一次性大批量补差可设 MAXMS（如 600000=10分钟）放宽；生产默认 7 分钟。 */
+    const DEADLINE = t0 + (Number(process.env.MAXMS) || 7 * 60000);
 
     async function run() {
       for (;;) {
