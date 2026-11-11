@@ -50,7 +50,10 @@ jobs:
         env:
           POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
-          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          # 🔴 2026-11-12 实测：GitHub runner 的出口 IP 直连 pocketapi.48.cn 完全放行
+          #    （在播 44 个、消息分页都 200）。仓库里那个 SCRAPE_PROXY 早已 407 过期，
+          #    留着只会每轮白等 2 次 CONNECT 超时，所以这里显式置空 = 纯直连。
+          SCRAPE_PROXY: ''
           WORKER_URL: ${{ vars.WORKER_URL || 'https://all48-archive.yqz-tansy.workers.dev' }}
           WATCH_UID: '89653517'
           ROOM_NICK: '王语晨'
