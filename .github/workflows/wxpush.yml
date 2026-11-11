@@ -1,0 +1,61 @@
+# 微信推送 · 王语晨 开播/下播 + 口袋房间消息（免费常驻）
+#
+# 为什么用 Actions：站长不想让推送依赖自己电脑常开，也不想为这件事买服务器。
+# 本仓库是 public ⇒ Actions 分钟数完全免费、不需要绑卡，是唯一「零成本 + 零门槛」的常驻方案。
+#
+# 🔴 延迟说明（这是这条路的唯一代价）：
+#   GitHub cron 最小粒度 5 分钟，且高峰期实际触发常有 5~15 分钟抖动。
+#   为把抖动吃掉，job 内部不跑一次就退，而是自己循环轮询 ~4.5 分钟
+#   ⇒ 覆盖窗口内房间消息 ≈ 20 秒可达；两个窗口之间的空档最多几分钟。
+#   要秒级就必须上常驻服务器（阿里云/Oracle/Vultr），这里是有意的取舍。
+#
+# 🔴 为什么不用 Actions 存状态：runner 每次都是全新机器，本地文件活不过一轮。
+#   游标（房间消息时间戳 / 当前场次 / 下播防抖计数）统一读写 Worker 的 wx:state。
+#
+# 🔴 免费额度：KV 每天 1000 次写。一轮只写 1 次心跳（288 轮/天）+ 有消息时多写，
+#   实测 ~300 次/天，安全。手机侧取件是读，读额度 10 万/天，不受影响。
+name: 微信推送 · 王语晨
+
+on:
+  schedule:
+    # 每 5 分钟一次（GitHub 最小粒度）；job 内自己跑 4.5 分钟补足覆盖
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      run_seconds:
+        description: '本轮跑多少秒（默认 270，最大 500）'
+        default: '270'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wxpush
+  cancel-in-progress: false
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 轮询开播/下播 + 房间消息，投递到微信队列
+        env:
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
+          WORKER_URL: ${{ vars.WORKER_URL || 'https://all48-archive.yqz-tansy.workers.dev' }}
+          WATCH_UID: '89653517'
+          ROOM_NICK: '王语晨'
+          ROOM_SRV: '2278592'
+          ROOM_CH: '2541547'
+          RUN_SECONDS: ${{ inputs.run_seconds || '270' }}
+          EVERY: '20'
+        run: node wx-actions.mjs
