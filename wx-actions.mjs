@@ -14,6 +14,10 @@
  *    roomT   房间消息游标（毫秒）
  *    liveId  当前在播场次（空 = 没在播）
  *    miss    连续几次没在列表里（连续 3 次才算真下播，防抖）
+ *    actT    最后一次「动作」的时间（开播/下播/发消息/翻牌都算）
+ *    online  1 = 在线（最近 1 小时内有动作），0 = 静默
+ *            ⚠️ 这是「动作心跳」推出来的，不是登录态 —— 口袋48 不公开登录接口。
+ *            她挂着 App 但一直不说话，超过 1 小时会被判静默，这是这套模型已知的偏差。
  *
  * 🔴 只推「她本人」：extInfo.channelRole === '2'；跳过 LIVEPUSH（开播归本脚本的 live 分支管）。
  *
@@ -93,6 +97,26 @@ async function getLives() {
   }).filter((x) => x.uid && x.liveId);
 }
 
+/** 从 bodys / attachment 里挖出可读文本。
+ *  翻牌的字段名不固定：云信侧是 attachment.content.answer / text / content，
+ *  网页/接口侧又可能是纯字符串或再套一层 JSON。逐层挖，挖不到返回空串。 */
+function pickText(raw) {
+  let o = raw;
+  for (let i = 0; i < 3 && typeof o === 'string' && o; i++) {
+    const s = o.trim();
+    if (!s) return '';
+    if (s[0] !== '{' && s[0] !== '[') return s;
+    try { o = JSON.parse(s); } catch { return s; }
+  }
+  if (typeof o === 'string') return o.trim();
+  if (!o || typeof o !== 'object') return '';
+  const c = (o.content && typeof o.content === 'object') ? o.content : o;
+  const arr = [c.answer, c.text, c.content, c.desc, c.question,
+    o.answer, o.text, o.content, o.desc];
+  for (const v of arr) if (typeof v === 'string' && v.trim()) return v.trim();
+  return '';
+}
+
 /** 一条 IM 消息 → {t,text} ；返回 null 表示不推 */
 function line(m) {
   let ext = {};
@@ -106,6 +130,13 @@ function line(m) {
   let content = '';
   if (type === 'TEXT') content = String(body || '').trim();
   else if (type === 'IMAGE') content = '[图片]';
+  /* 🔴 翻牌（FLIPCARD_AUDIO / FLIPCARD_VIDEO）以前直接落到 else 被丢掉，
+     2026-11-12 补上：翻牌是她最主动的动作之一，也是「上线」的重要信号。
+     真实文本藏在 bodys 里，字段名三种写法都遇到过 ⇒ 统一交给 pickText 挖。 */
+  else if (/^FLIPCARD/i.test(type) || type === 'AUDIO_GIFT_REPLY') {
+    const txt = pickText(body);
+    content = '[翻牌]' + (txt ? ' ' + txt : '');
+  }
   else if (type === 'AUDIO' || type === 'VOICE') {
     let sec = 0;
     try { sec = Number(JSON.parse(body).duration) || 0; } catch { }
@@ -147,6 +178,9 @@ async function collect(since) {
 async function tick(st, first) {
   const items = [];
   const next = { ...st };
+  /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
+     这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
+  let active = false;
 
   /* ① 开播 / 下播 */
   let cur = null;
@@ -179,6 +213,8 @@ async function tick(st, first) {
       });
       log(`开播 → ${cur.liveId} 「${cur.title}」`);
     }
+    active = true;                       // 在播 = 她肯定在线
+    next.lastKind = 'live';              // 给上下线日志用（Worker 侧记进 wx:log）
     next.liveId = cur.liveId;
     next.liveTitle = cur.title;
     next.liveCtime = cur.ctime;
@@ -193,6 +229,8 @@ async function tick(st, first) {
         text: `【${NICK}·下播】${mins ? '这场播了 ' + mins + ' 分钟' : '直播结束'}`,
       });
       log(`下播 → ${st.liveId}，播了 ${mins} 分钟`);
+      active = true;                     // 刚下播 = 刚才还在动，刷新活跃时间
+      next.lastKind = 'end';
       next.liveId = '';
       next.liveTitle = '';
       next.liveCtime = 0;
@@ -225,13 +263,55 @@ async function tick(st, first) {
         });
       }
       next.roomT = newest;
+      active = true;                       // 有新发言 = 她在线
+      next.lastKind = msgs.some((m) => /^\[翻牌\]/.test(m.text)) ? 'flip' : 'msg';
       log(`房间消息 ${msgs.length} 条，最新 ${bjTime(newest)}`);
-    } else if (!st.roomT) {
-      next.roomT = now;                    // 没有历史可补也要落游标
+    } else if (!st.roomT || Number(st.roomT) < floor) {
+      /* 游标为空，或者已经落后到 10 分钟窗口之外（含历史脏值：早期测试写进去的 123）
+         ⇒ 推到 now。否则游标会永远停在那个旧值，每轮都在重复扫同一个窗口。 */
+      next.roomT = now;
     }
   } catch (e) {
     next.err = 'room:' + String(e.message || e).slice(0, 60);
     log('查房间消息失败：' + next.err);
+  }
+
+  /* ③ 在线状态 —— 只看「最后一次动作」，不猜登录态
+     🔴 口袋48 不对外暴露成员登录/在线接口（2026-11-12 确认过），所以「她上线了」只能这么推：
+        抓到任何动作（开播 / 下播 / 发消息 / 翻牌）⇒ 在线；
+        超过 1 小时没有任何动作 ⇒ 判静默（不是「下线」，措辞不撒谎）。
+     🔴 冷启动保护：游标里还没有 actT 时只记录、不推送 ——
+        否则每次新 runner 起来都会在群里诈一句「上线了」，而人可能一直都在。
+     🔴 静默提示只在白天（北京 08:00 以后）发，半夜不吵人；状态照样更新。 */
+  const ONLINE_MS = 60 * 60e3;
+  const prevOnline = Number(st.online) === 1;
+  if (active) {
+    next.actT = now;
+    next.online = 1;
+    /* 从静默恢复 ⇒ 推一条「上线」。开播/下播本身就带提示，不再重复。 */
+    const hasLiveItem = items.some((x) => /^live:/.test(String(x.id)));
+    if (!prevOnline && Number(st.actT) && !hasLiveItem) {
+      items.unshift({
+        id: 'on:' + now,
+        t: now,
+        text: `【${NICK}·上线】${bjTime(now, false)} 有动静了`,
+      });
+      log('上线 → 从静默恢复');
+    }
+  } else if (prevOnline && Number(st.actT) && now - Number(st.actT) > ONLINE_MS) {
+    next.online = 0;
+    const h = Math.round((now - Number(st.actT)) / 36e5);
+    const bjHour = new Date(now + BJ).getUTCHours();
+    if (bjHour >= 8) {
+      items.push({
+        id: 'off:' + st.actT,
+        t: now,
+        text: `【${NICK}·静默】已经 ${h} 小时没有动静了`,
+      });
+      log(`静默 → ${h} 小时无动作`);
+    } else {
+      log(`静默 → ${h} 小时无动作（夜间，不推送）`);
+    }
   }
 
   if (items.length) delete next.err;
