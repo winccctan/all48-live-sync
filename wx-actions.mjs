@@ -144,7 +144,7 @@ async function collect(since) {
 
 /* ---------------- 一轮 ---------------- */
 
-async function tick(st) {
+async function tick(st, first) {
   const items = [];
   const next = { ...st };
 
@@ -153,6 +153,9 @@ async function tick(st) {
   try {
     const list = await getLives();
     cur = list.find((x) => x.uid === WATCH_UID) || null;
+    /* 🔴 首轮必须打这一行：这是「runner 出口能不能直连口袋48」的唯一证据。
+       打出来 = 数据源通；打不出来（或紧跟着「查直播失败」）= 出口被拦，得换机房。 */
+    if (first) log(`数据源 OK：全站在播 ${list.length} 个，她在${cur ? '播「' + cur.title + '」' : '没在播'}`);
   } catch (e) {
     next.err = 'live:' + String(e.message || e).slice(0, 60);
     log('查直播失败：' + next.err);
@@ -204,6 +207,7 @@ async function tick(st) {
   const since = Math.max(Number(st.roomT) || 0, floor);
   try {
     const msgs = await collect(since);
+    if (first) log(`消息源 OK：最近 10 分钟她有 ${msgs.length} 条本人发言`);
     if (msgs.length) {
       const newest = msgs[msgs.length - 1].t;
       if (msgs.length === 1) {
@@ -251,7 +255,7 @@ log('游标 =', JSON.stringify(st));
 let n = 0;
 while (Date.now() < until) {
   n++;
-  try { st = await tick(st); } catch (e) {
+  try { st = await tick(st, n === 1); } catch (e) {
     log('本轮异常：' + String(e.message || e).slice(0, 120));
     st = { ...st, at: Date.now(), err: String(e.message || e).slice(0, 60) };
     try { await push([], st); } catch { }
