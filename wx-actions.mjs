@@ -341,13 +341,17 @@ async function tickOne(w, st, lives, first) {
      真关掉 App 之后 20 分钟内也一定会报下线。 */
   const ONLINE_MS = Math.max(60e3, Number(process.env.WX_ONLINE_MS) || 20 * 60e3);
   const prevOnline = Number(st.online) === 1;
+  /* 🔴 2026-11-12 修：原来上线判定要求「历史 actT 非空」，但 job 换机器时 actT 可能已被
+     下线分支清成 0 / 或从没落地过 ⇒ 群里的「上线了」一条都发不出去（桥的已推记录 0 条 on:）。
+     改成「以前见过她任何痕迹就算见过人」，只要状态从 0 翻到 1 就播报。 */
+  const everSeen = Number(st.actT) > 0 || Number(st.onT) > 0 || Number(st.roomT) > 0;
   if (active) {
     if (!prevOnline) next.onT = now;      // 这一轮才刚上线，开始计时
     next.actT = now;
     next.online = 1;
     /* 从静默恢复 ⇒ 推一条「上线」。开播/下播本身就带提示，不再重复。 */
     const hasLiveItem = items.some((x) => /^live:/.test(String(x.id)));
-    if (!prevOnline && Number(st.actT) && !hasLiveItem) {
+    if (!prevOnline && everSeen && !hasLiveItem) {
       const lastOn = Number(st.onPushT) || 0;
       if (now - lastOn >= 15 * 60e3) {
         items.unshift({
@@ -362,7 +366,12 @@ async function tickOne(w, st, lives, first) {
         log(`上线（${Math.round((now - lastOn) / 60e3)} 分钟内刚播报过，不刷屏）`);
       }
     }
-  } else if (prevOnline && Number(st.actT) && !first
+  } else if (prevOnline && Number(st.actT)
+    /* 🔴 2026-11-12：原来第一轮（!first）绝不判下线，可 job 只活 4.5 分钟、
+       断档时下一 job 首轮又跳过 ⇒ 某次「20 分钟静默」永远等不到第二轮的判定，
+       结果 wx:log 里只有 on、一条 off 都没有。改成：首轮也判，但要多给 10 分钟宽限，
+       避免「上个 job 结束 → 本 job 开始」的空档被当成她走了。 */
+    && (!first || now - Number(st.actT) > ONLINE_MS + 10 * 60e3)
     && now - Number(st.actT) > ONLINE_MS) {
     next.online = 0;
     const onT = Number(st.onT) || Number(st.actT);
