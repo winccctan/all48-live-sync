@@ -76,6 +76,16 @@ function bjHMS(ms) {
   const d = new Date((Number(ms) || Date.now()) + BJ);
   return '[' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds()) + ']';
 }
+/** 在线时长文案（站长样例：`在线时长7分33秒`，用「分」不用「分钟」） */
+function fmtDur(sec) {
+  const s0 = Math.max(0, Math.round(Number(sec) || 0));
+  const h = Math.floor(s0 / 3600);
+  const m = Math.floor((s0 % 3600) / 60);
+  const s = s0 % 60;
+  if (h) return h + '小时' + (m ? m + '分' : '') + (s ? s + '秒' : '');
+  if (m) return m + '分' + (s ? s + '秒' : '');
+  return s + '秒';
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -294,39 +304,55 @@ async function tickOne(w, st, lives, first) {
     log(`${w.nick} 查房间消息失败：` + next.err);
   }
 
-  /* ③ 在线状态 —— 只看「最后一次动作」，不猜登录态
-     🔴 口袋48 不对外暴露成员登录/在线接口（2026-11-12 确认过），所以「她上线了」只能这么推：
-        抓到任何动作（开播 / 下播 / 发消息 / 翻牌）⇒ 在线；
-        超过 1 小时没有任何动作 ⇒ 判静默（不是「下线」，措辞不撒谎）。
-     🔴 冷启动保护：游标里还没有 actT 时只记录、不推送 ——
-        否则每次新 runner 起来都会在群里诈一句「上线了」，而人可能一直都在。
-     🔴 静默提示只在白天（北京 08:00 以后）发，半夜不吵人；状态照样更新。 */
-  const ONLINE_MS = 60 * 60e3;
+  /* ③ 上下线 —— 站长口径（2026-11-12）：**最后动作 + 5 分钟没有新动作 = 下线**。
+     🔴 「下线时刻」不能写判定时刻，要写 `actT + 5 分钟`。
+        Actions 每 5 分钟才起一个 job，判定往往晚十几分钟才发生，但群里该显示的是
+        她真正停下的那一刻。站长给的样例 `13:51:07 上线 → [13:58:40] 下线 / 在线 7分33秒`
+        就是 actT=13:53:40 时算出来的，所以 offT 和时长都基于 actT，而不是 now。
+     🔴 跨 job 保护：每个 job 的**第一轮不做下线判定**（`first`）——
+        上个 job 结束后有一段没人在看的空档，不能拿空档当「她走了」，
+        否则每个 job 起头都会诈一句「下线了」。
+     🔴 上线通知 15 分钟冷却：她挂机不说话会被判下线、一动又判上线，
+        不冷却群消息会被刷成心电图。状态照记，只是不重复播报。
+     🔴 太旧的离线（>30 分钟）只记状态不推送；夜间（北京 08:00 前）不推下线，免得吵人。 */
+  const ONLINE_MS = 5 * 60e3;
   const prevOnline = Number(st.online) === 1;
   if (active) {
+    if (!prevOnline) next.onT = now;      // 这一轮才刚上线，开始计时
     next.actT = now;
     next.online = 1;
     /* 从静默恢复 ⇒ 推一条「上线」。开播/下播本身就带提示，不再重复。 */
     const hasLiveItem = items.some((x) => /^live:/.test(String(x.id)));
     if (!prevOnline && Number(st.actT) && !hasLiveItem) {
-      items.unshift({
-        id: 'on:' + now,
-        t: now,
-        text: `💡${bjHMS(now)} ${w.nick} 上线了`,
-        who: w.nick,
-      });
-      log('上线 → 从静默恢复');
+      const lastOn = Number(st.onPushT) || 0;
+      if (now - lastOn >= 15 * 60e3) {
+        items.unshift({
+          id: 'on:' + now,
+          t: now,
+          text: `💡${bjHMS(now)}${w.nick} 上线了`,
+          who: w.nick,
+        });
+        next.onPushT = now;
+        log(`上线 → ${w.nick} 有动静`);
+      } else {
+        log(`上线（${Math.round((now - lastOn) / 60e3)} 分钟内刚播报过，不刷屏）`);
+      }
     }
-  } else if (prevOnline && Number(st.actT) && now - Number(st.actT) > ONLINE_MS) {
+  } else if (prevOnline && Number(st.actT) && !first
+    && now - Number(st.actT) > ONLINE_MS) {
     next.online = 0;
-    const h = Math.round((now - Number(st.actT)) / 36e5);
-    const bjHour = new Date(now + BJ).getUTCHours();
-    if (bjHour >= 8) {
-      add('off:' + st.actT, now, `${bjHMS(now)} ${w.nick} 静默了（已经 ${h} 小时没动静）`);
-      log(`静默 → ${h} 小时无动作`);
+    const onT = Number(st.onT) || Number(st.actT);
+    const offT = Number(st.actT) + ONLINE_MS;   // 她真正停下的时刻
+    const dur = Math.max(0, Math.round((offT - onT) / 1000));
+    const stale = now - offT > 30 * 60e3;       // 判得太晚（job 断档），只记状态
+    const bjHour = new Date(offT + BJ).getUTCHours();
+    if (!stale && bjHour >= 8) {
+      add('off:' + st.actT, offT, `🕑${bjHMS(offT)}${w.nick} 下线了\n在线时长${fmtDur(dur)}`);
+      log(`下线 → 在线 ${fmtDur(dur)}`);
     } else {
-      log(`静默 → ${h} 小时无动作（夜间，不推送）`);
+      log(`下线（${stale ? '判定太晚' : '夜间'}，不推送）→ 在线 ${fmtDur(dur)}`);
     }
+    next.onT = 0;
   }
 
   if (items.length) delete next.err;
