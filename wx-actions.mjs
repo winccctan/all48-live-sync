@@ -234,6 +234,11 @@ async function tickOne(w, st, lives, first) {
   /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
      这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
   let active = false;
+  /* 🔴 动作发生的「真实时刻」集合（不是我们轮询到它的时刻）。
+     站长 2026-11-12 18:57：`17:55 粗发` + `💡[17:55:38]上线了` 顺序反了，
+     别人 bot 给的是 `💡[17:55:02]上线了` —— 上线必须用她真正开口的那一刻，
+     而且时间戳要早于/等于消息，桥按 t 排序时才会排在消息前面。 */
+  const acts = [];
   const add = (id, t, text, img) => items.push(img
     ? { id, t, text, who: w.nick, img }
     : { id, t, text, who: w.nick });
@@ -263,6 +268,7 @@ async function tickOne(w, st, lives, first) {
       log(`开播 → ${cur.liveId} 「${cur.title}」`);
     }
     active = true;                       // 在播 = 她肯定在线
+    acts.push(Number(cur.ctime) || Date.now());   // 开播那一刻
     next.lastKind = 'live';              // 给上下线日志用（Worker 侧记进 wx:log）
     next.liveId = cur.liveId;
     next.liveTitle = cur.title;
@@ -276,6 +282,7 @@ async function tickOne(w, st, lives, first) {
         `【${w.nick}·下播】${mins ? '这场播了 ' + mins + ' 分钟' : '直播结束'}`);
       log(`下播 → ${st.liveId}，播了 ${mins} 分钟`);
       active = true;                     // 刚下播 = 刚才还在动，刷新活跃时间
+      acts.push(Date.now());
       next.lastKind = 'end';
       next.liveId = '';
       next.liveTitle = '';
@@ -304,6 +311,7 @@ async function tickOne(w, st, lives, first) {
       }
       next.roomT = newest;
       active = true;                       // 有新发言 = 她在线
+      acts.push(msgs[0].t, newest);        // 第一句（她真正上线的时刻）+ 最后一句
       next.lastKind = msgs.some((m) => /^\[翻牌\]/.test(m.text)) ? 'flip' : 'msg';
       log(`房间消息 ${msgs.length} 条，最新 ${bjTime(newest)}`);
       /* 图片单独成条（text 为空、只带 img）：桥先发上面那条文本，再逐张发真图。
@@ -342,25 +350,30 @@ async function tickOne(w, st, lives, first) {
      下线分支清成 0 / 或从没落地过 ⇒ 群里的「上线了」一条都发不出去（桥的已推记录 0 条 on:）。
      改成「以前见过她任何痕迹就算见过人」，只要状态从 0 翻到 1 就播报。 */
   const everSeen = Number(st.actT) > 0 || Number(st.onT) > 0 || Number(st.roomT) > 0;
+  /* 本轮动作的真实时刻（她手机上的那一刻，不是我们轮询到的那一刻）：
+     evFirst = 这一轮第一次动 ⇒ 「上线」播报时间用它；
+     evLast  = 最后一次动 ⇒ 记进 actT，算下线时刻（actT + 阈值）。 */
+  const evFirst = acts.length ? Math.min(...acts, now) : now;   // 夹一下 now：服务端时间偶尔比本地快
+  const evLast = acts.length ? Math.min(Math.max(...acts), now) : now;
   if (active) {
-    if (!prevOnline) next.onT = now;      // 这一轮才刚上线，开始计时
-    next.actT = now;
+    if (!prevOnline) next.onT = evFirst;  // 这一轮才刚上线，开始计时
+    next.actT = evLast;
     next.online = 1;
     /* 从静默恢复 ⇒ 推一条「上线」。开播/下播本身就带提示，不再重复。 */
     const hasLiveItem = items.some((x) => /^live:/.test(String(x.id)));
     if (!prevOnline && everSeen && !hasLiveItem) {
       const lastOn = Number(st.onPushT) || 0;
-      if (now - lastOn >= ON_COOLDOWN_MS) {
+      if (evFirst - lastOn >= ON_COOLDOWN_MS) {
         items.unshift({
-          id: 'on:' + now,
-          t: now,
-          text: `💡${bjHMS(now)}${w.nick} 上线了`,
+          id: 'on:' + evFirst,
+          t: evFirst,
+          text: `💡${bjHMS(evFirst)}${w.nick} 上线了`,
           who: w.nick,
         });
-        next.onPushT = now;
-        log(`上线 → ${w.nick} 有动静`);
+        next.onPushT = evFirst;
+        log(`上线 → ${w.nick} ${bjHMS(evFirst)}（动作时刻，判定延迟 ${Math.round((now - evFirst) / 1000)} 秒）`);
       } else {
-        log(`上线（${Math.round((now - lastOn) / 60e3)} 分钟内刚播报过，不刷屏）`);
+        log(`上线（${Math.round((evFirst - lastOn) / 60e3)} 分钟内刚播报过，不刷屏）`);
       }
     }
   } else if (prevOnline && Number(st.actT)
