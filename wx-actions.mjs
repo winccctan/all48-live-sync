@@ -170,8 +170,18 @@ function line(m) {
   let body = '';
   try { body = typeof m.bodys === 'string' ? m.bodys : JSON.stringify(m.bodys || {}); } catch { body = ''; }
   let content = '';
+  /* 🔴 图片要发真图（2026-11-12 站长：「图片要展示出来具体的图片」）。
+     bodys 里是云信 NOS 直链：{"size":638754,"ext":"jpg","w":3024,"url":"https://kd48-nosdn...","md5":"..."}
+     ⇒ 把 url 带出去，桥下载后用 `wx send --image` 真发一张，而不是干巴巴一个 [图片]。 */
+  let img = '';
   if (type === 'TEXT') content = String(body || '').trim();
-  else if (type === 'IMAGE') content = '[图片]';
+  else if (type === 'IMAGE') {
+    content = '[图片]';
+    try {
+      const b = JSON.parse(body);
+      img = String(b.url || b.imageUrl || b.picUrl || '');
+    } catch { img = ''; }
+  }
   /* 🔴 翻牌（FLIPCARD_AUDIO / FLIPCARD_VIDEO）以前直接落到 else 被丢掉，
      2026-11-12 补上：翻牌是她最主动的动作之一，也是「上线」的重要信号。
      真实文本藏在 bodys 里，字段名三种写法都遇到过 ⇒ 统一交给 pickText 挖。 */
@@ -187,7 +197,7 @@ function line(m) {
   else return null;
 
   if (!content) return null;
-  return { t: Number(m.msgTime) || 0, text: content };
+  return { t: Number(m.msgTime) || 0, text: content, img };
 }
 
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光） */
@@ -225,7 +235,9 @@ async function tickOne(w, st, lives, first) {
   /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
      这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
   let active = false;
-  const add = (id, t, text) => items.push({ id, t, text, who: w.nick });
+  const add = (id, t, text, img) => items.push(img
+    ? { id, t, text, who: w.nick, img }
+    : { id, t, text, who: w.nick });
 
   /* ① 开播 / 下播 */
   let cur = null;
@@ -295,6 +307,11 @@ async function tickOne(w, st, lives, first) {
       active = true;                       // 有新发言 = 她在线
       next.lastKind = msgs.some((m) => /^\[翻牌\]/.test(m.text)) ? 'flip' : 'msg';
       log(`房间消息 ${msgs.length} 条，最新 ${bjTime(newest)}`);
+      /* 图片单独成条（text 为空、只带 img）：桥先发上面那条文本，再逐张发真图。
+         合进文本里发不出去 —— 微信只认本地文件，URL 贴出来就是一行丑链接。 */
+      for (const im of msgs.filter((x) => x.img)) {
+        add('roomimg:' + w.uid + ':' + im.t, im.t, '', im.img);
+      }
     } else if (!st.roomT || Number(st.roomT) < floor) {
       /* 游标为空，或者已经落后到 10 分钟窗口之外（含历史脏值：早期测试写进去的 123）
          ⇒ 推到 now。否则游标会永远停在那个旧值，每轮都在重复扫同一个窗口。 */
