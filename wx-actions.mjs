@@ -34,6 +34,31 @@ const WATCH_UID = String(process.env.WATCH_UID || '89653517');   // 王语晨
 const NICK = process.env.ROOM_NICK || '王语晨';
 const SRV = String(process.env.ROOM_SRV || '2278592');
 const CH = String(process.env.ROOM_CH || '2541547');
+
+/* 🔴 多成员（2026-11-12 站长：「bot小群对接黄宣绮的口袋发言和直播 和上下线」）
+   一个 runner 里跑几个人比开几个 job 便宜得多：直播列表是**全站一份**，取一次就够；
+   只有房间消息要按人各拉一次。每个成员的游标在 worker 侧分开存（wx:state:<uid>），
+   否则两个人共用一个 roomT/liveId 会互相踩。
+   env 写法（JSON 数组）：WATCHES=[{"uid":"89653517","nick":"王语晨","srv":"2278592","ch":"2541547"},…]
+   不配时退回老的单成员 WATCH_UID/ROOM_*。 */
+const WATCHES = (() => {
+  const raw = String(process.env.WATCHES || '').trim();
+  if (raw) {
+    try {
+      const a = JSON.parse(raw);
+      const ok = (Array.isArray(a) ? a : []).map((x) => ({
+        uid: String(x.uid || '').trim(),
+        nick: String(x.nick || x.name || '').trim(),
+        srv: String(x.srv || '').trim(),
+        ch: String(x.ch || '').trim(),
+      })).filter((x) => x.uid && x.nick && x.srv && x.ch);
+      if (ok.length) return ok;
+      console.warn('WATCHES 里没有一条完整（uid/nick/srv/ch 都要），退回单成员');
+    } catch (e) { console.warn('WATCHES 不是合法 JSON：' + e.message); }
+  }
+  return [{ uid: WATCH_UID, nick: NICK, srv: SRV, ch: CH }];
+})();
+
 const RUN = Math.max(45, Number(process.env.RUN_SECONDS || 270)) * 1000;
 const EVERY = Math.max(10, Number(process.env.EVERY || 20)) * 1000;
 const DRY = !!process.env.DRY;
@@ -46,6 +71,11 @@ function bjTime(ms, withDate) {
   const hm = p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes());
   return withDate === false ? hm : `${d.getUTCMonth() + 1}-${p2(d.getUTCDate())} ${hm}`;
 }
+/** 站长要的样式：`[13:51:07]`（带秒）—— 上下线这种事件秒级才有意义 */
+function bjHMS(ms) {
+  const d = new Date((Number(ms) || Date.now()) + BJ);
+  return '[' + p2(d.getUTCHours()) + ':' + p2(d.getUTCMinutes()) + ':' + p2(d.getUTCSeconds()) + ']';
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -54,15 +84,16 @@ if (!INGEST && !DRY) { console.error('缺 INGEST_TOKEN'); process.exit(1); }
 
 /* ---------------- Worker 侧游标 / 队列 ---------------- */
 
-async function stateGet() {
-  const r = await fetch(`${WORKER}/api/wxq/state`, { headers: HDR, signal: AbortSignal.timeout(15000) });
+/** 每个成员一份游标：?u=<uid> ⇒ worker 存 wx:state:<uid> */
+async function stateGet(uid) {
+  const r = await fetch(`${WORKER}/api/wxq/state?u=${encodeURIComponent(uid)}`, { headers: HDR, signal: AbortSignal.timeout(15000) });
   if (!r.ok) throw new Error('读游标 HTTP ' + r.status);
   const j = await r.json();
   const s = j && (j.state || j.data || j);
   return (s && typeof s === 'object' && !Array.isArray(s)) ? s : {};
 }
 
-async function push(items, state) {
+async function push(items, state, who) {
   if (DRY) {
     for (const it of items) log('[DRY] 会推：' + it.text.replace(/\n/g, ' / '));
     log('[DRY] state =', JSON.stringify(state));
@@ -70,7 +101,7 @@ async function push(items, state) {
   }
   const r = await fetch(`${WORKER}/api/wxq/push`, {
     method: 'POST', headers: HDR,
-    body: JSON.stringify({ items, state }),
+    body: JSON.stringify({ items, state, u: who && who.uid, who: who && who.nick }),
     signal: AbortSignal.timeout(20000),
   });
   if (!r.ok) throw new Error('投递 HTTP ' + r.status);
@@ -149,11 +180,11 @@ function line(m) {
 }
 
 /** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光） */
-async function collect(since) {
+async function collect(since, w) {
   const out = [];
   let nextTime = 0;
   for (let p = 0; p < 6; p++) {
-    const r = await fetchMessagePage({ serverId: SRV, channelId: CH, nextTime, limit: 50, token: TOKEN });
+    const r = await fetchMessagePage({ serverId: w.srv, channelId: w.ch, nextTime, limit: 50, token: TOKEN });
     const msgs = (r && r.messages) || [];
     if (!msgs.length) break;
     let oldest = Infinity;
@@ -173,26 +204,25 @@ async function collect(since) {
   return out.sort((a, b) => a.t - b.t);
 }
 
-/* ---------------- 一轮 ---------------- */
+/* ---------------- 一轮（单个成员） ----------------
+ * `lives` 由主循环**只取一次**（全站在播列表），几个人共用，省掉 N 次重复请求。
+ * 返回下轮游标。文案统一成站长给的样式：`[13:51:07] 王语晨 上线了`。 */
 
-async function tick(st, first) {
+async function tickOne(w, st, lives, first) {
   const items = [];
   const next = { ...st };
   /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
      这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
   let active = false;
+  const add = (id, t, text) => items.push({ id, t, text, who: w.nick });
 
   /* ① 开播 / 下播 */
   let cur = null;
-  try {
-    const list = await getLives();
-    cur = list.find((x) => x.uid === WATCH_UID) || null;
-    /* 🔴 首轮必须打这一行：这是「runner 出口能不能直连口袋48」的唯一证据。
-       打出来 = 数据源通；打不出来（或紧跟着「查直播失败」）= 出口被拦，得换机房。 */
-    if (first) log(`数据源 OK：全站在播 ${list.length} 个，她${cur ? '正在播「' + cur.title + '」' : '没在播'}`);
-  } catch (e) {
-    next.err = 'live:' + String(e.message || e).slice(0, 60);
-    log('查直播失败：' + next.err);
+  if (lives) {
+    cur = lives.find((x) => x.uid === w.uid) || null;
+    if (first) log(`${w.nick}：${cur ? '正在播「' + cur.title + '」' : '没在播'}`);
+  } else {
+    next.err = 'live:unavailable';
   }
 
   if (cur) {
@@ -204,13 +234,10 @@ async function tick(st, first) {
     const coldStart = !st.liveId && startedAgo > 30 * 60e3;
     if (cur.liveId !== (st.liveId || '') && !coldStart) {
       const mins = cur.ctime ? Math.max(0, Math.round((Date.now() - cur.ctime) / 60000)) : 0;
-      items.push({
-        id: 'live:' + cur.liveId + ':start',
-        t: Date.now(),
-        text: `【${NICK}·开播】${cur.title || '直播中'}\n`
-          + (mins > 5 ? `已经播了 ${mins} 分钟\n` : '')
-          + `https://h5.48.cn/2017/live/index.html?liveId=${cur.liveId}`,
-      });
+      add('live:' + cur.liveId + ':start', Date.now(),
+        `【${w.nick}·开播】${cur.title || '直播中'}\n`
+        + (mins > 5 ? `已经播了 ${mins} 分钟\n` : '')
+        + `https://h5.48.cn/2017/live/index.html?liveId=${cur.liveId}`);
       log(`开播 → ${cur.liveId} 「${cur.title}」`);
     }
     active = true;                       // 在播 = 她肯定在线
@@ -223,11 +250,8 @@ async function tick(st, first) {
     next.miss = miss;
     if (miss >= 3) {                       // 连续 3 次（≈1 分钟）都没在列表里才算真下播
       const mins = st.liveCtime ? Math.max(1, Math.round((Date.now() - st.liveCtime) / 60000)) : 0;
-      items.push({
-        id: 'live:' + st.liveId + ':end',
-        t: Date.now(),
-        text: `【${NICK}·下播】${mins ? '这场播了 ' + mins + ' 分钟' : '直播结束'}`,
-      });
+      add('live:' + st.liveId + ':end', Date.now(),
+        `【${w.nick}·下播】${mins ? '这场播了 ' + mins + ' 分钟' : '直播结束'}`);
       log(`下播 → ${st.liveId}，播了 ${mins} 分钟`);
       active = true;                     // 刚下播 = 刚才还在动，刷新活跃时间
       next.lastKind = 'end';
@@ -244,23 +268,17 @@ async function tick(st, first) {
   const floor = now - 10 * 60e3;
   const since = Math.max(Number(st.roomT) || 0, floor);
   try {
-    const msgs = await collect(since);
-    if (first) log(`消息源 OK：最近 10 分钟她有 ${msgs.length} 条本人发言`);
+    const msgs = await collect(since, w);
+    if (first) log(`${w.nick}：最近 10 分钟她有 ${msgs.length} 条本人发言`);
     if (msgs.length) {
       const newest = msgs[msgs.length - 1].t;
       if (msgs.length === 1) {
-        items.push({
-          id: 'room:' + msgs[0].t,
-          t: msgs[0].t,
-          text: `【${NICK}·口袋房间】${bjTime(msgs[0].t)}\n${msgs[0].text}`,
-        });
+        add('room:' + w.uid + ':' + msgs[0].t, msgs[0].t,
+          `【${w.nick}·口袋房间】${bjTime(msgs[0].t)}\n${msgs[0].text}`);
       } else {
         const lines = msgs.map((it) => `${bjTime(it.t, false)}  ${it.text}`).join('\n');
-        items.push({
-          id: 'room:' + newest,
-          t: newest,
-          text: `【${NICK}·口袋房间】${msgs.length} 条新消息\n${lines}`,
-        });
+        add('room:' + w.uid + ':' + newest, newest,
+          `【${w.nick}·口袋房间】${msgs.length} 条新消息\n${lines}`);
       }
       next.roomT = newest;
       active = true;                       // 有新发言 = 她在线
@@ -273,7 +291,7 @@ async function tick(st, first) {
     }
   } catch (e) {
     next.err = 'room:' + String(e.message || e).slice(0, 60);
-    log('查房间消息失败：' + next.err);
+    log(`${w.nick} 查房间消息失败：` + next.err);
   }
 
   /* ③ 在线状态 —— 只看「最后一次动作」，不猜登录态
@@ -294,7 +312,8 @@ async function tick(st, first) {
       items.unshift({
         id: 'on:' + now,
         t: now,
-        text: `【${NICK}·上线】${bjTime(now, false)} 有动静了`,
+        text: `💡${bjHMS(now)} ${w.nick} 上线了`,
+        who: w.nick,
       });
       log('上线 → 从静默恢复');
     }
@@ -303,11 +322,7 @@ async function tick(st, first) {
     const h = Math.round((now - Number(st.actT)) / 36e5);
     const bjHour = new Date(now + BJ).getUTCHours();
     if (bjHour >= 8) {
-      items.push({
-        id: 'off:' + st.actT,
-        t: now,
-        text: `【${NICK}·静默】已经 ${h} 小时没有动静了`,
-      });
+      add('off:' + st.actT, now, `${bjHMS(now)} ${w.nick} 静默了（已经 ${h} 小时没动静）`);
       log(`静默 → ${h} 小时无动作`);
     } else {
       log(`静默 → ${h} 小时无动作（夜间，不推送）`);
@@ -316,29 +331,43 @@ async function tick(st, first) {
 
   if (items.length) delete next.err;
   next.at = Date.now();
-  await push(items, next);
+  await push(items, next, w);
   return next;
 }
 
 /* ---------------- 主循环 ---------------- */
 
 const until = Date.now() + RUN;
-log(`启动：盯 ${NICK}(${WATCH_UID})，跑 ${Math.round(RUN / 1000)} 秒，每 ${Math.round(EVERY / 1000)} 秒一次`);
+log(`启动：盯 ${WATCHES.map((w) => w.nick + '(' + w.uid + ')').join('、')}，`
+  + `跑 ${Math.round(RUN / 1000)} 秒，每 ${Math.round(EVERY / 1000)} 秒一次`);
 
-let st = {};
-try { st = await stateGet(); } catch (e) {
-  st = { err: 'state:' + String(e.message || e).slice(0, 60) };
-  log('读游标失败（本轮从头算）：' + st.err);
+const states = new Map();          // uid -> 游标对象
+for (const w of WATCHES) {
+  try { states.set(w.uid, await stateGet(w.uid)); } catch (e) {
+    states.set(w.uid, { err: 'state:' + String(e.message || e).slice(0, 60) });
+    log(`${w.nick} 读游标失败（本轮从头算）：` + e.message);
+  }
+  log(`${w.nick} 游标 =`, JSON.stringify(states.get(w.uid)));
 }
-log('游标 =', JSON.stringify(st));
 
 let n = 0;
 while (Date.now() < until) {
   n++;
-  try { st = await tick(st, n === 1); } catch (e) {
-    log('本轮异常：' + String(e.message || e).slice(0, 120));
-    st = { ...st, at: Date.now(), err: String(e.message || e).slice(0, 60) };
-    try { await push([], st); } catch { }
+  /* 全站在播列表：一次请求给所有人用 */
+  let lives = null;
+  try { lives = await getLives(); } catch (e) {
+    log('查直播失败：' + String(e.message || e).slice(0, 80));
+  }
+  for (const w of WATCHES) {
+    try {
+      const nx = await tickOne(w, states.get(w.uid) || {}, lives, n === 1);
+      states.set(w.uid, nx);
+    } catch (e) {
+      log(`${w.nick} 本轮异常：` + String(e.message || e).slice(0, 120));
+      const st = { ...(states.get(w.uid) || {}), at: Date.now(), err: String(e.message || e).slice(0, 60) };
+      states.set(w.uid, st);
+      try { await push([], st, w); } catch { }
+    }
   }
   const left = until - Date.now();
   if (left <= 0) break;

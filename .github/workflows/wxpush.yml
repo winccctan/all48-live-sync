@@ -55,6 +55,11 @@ jobs:
           #    留着只会每轮白等 2 次 CONNECT 超时，所以这里显式置空 = 纯直连。
           SCRAPE_PROXY: ''
           WORKER_URL: ${{ vars.WORKER_URL || 'https://all48-archive.yqz-tansy.workers.dev' }}
+          # 🔴 多人盯：一个 runner 里跑完（直播列表全站一份，只对房间消息各拉一次）。
+          #    游标在 worker 侧按 uid 分开存（wx:state:<uid>），互不覆盖。
+          #    格式：uid / nick / srv / ch（后两个来自 /data/members.js 的 srv、ch 字段）
+          WATCHES: '[{"uid":"89653517","nick":"王语晨","srv":"2278592","ch":"2541547"},{"uid":"45285685","nick":"黄宣绮","srv":"1115198","ch":"1247180"}]'
+          # 旧单成员变量保留（WATCHES 解析失败时的回退）
           WATCH_UID: '89653517'
           ROOM_NICK: '王语晨'
           ROOM_SRV: '2278592'
