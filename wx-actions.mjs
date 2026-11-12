@@ -15,10 +15,9 @@
  *    liveId  当前在播场次（空 = 没在播）
  *    miss    连续几次没在列表里（连续 3 次才算真下播，防抖）
  *    actT    最后一次「动作」的时间（开播/下播/发消息/翻牌都算）
- *    online  1 = 在线（最近 `WX_ONLINE_MS` 分钟内有动作，默认 20 分钟），0 = 静默
+ *    online  1 = 在线（最近 `WX_ONLINE_MS` 分钟内有动作，默认 **5 分钟**），0 = 静默
  *            ⚠️ 这是「动作心跳」推出来的，不是登录态 —— 口袋48 不公开登录接口（HTTP 层没有在线字段）。
- *            站长 2026-11-12 的口径是「她开着 App 就算在线」，所以阈值放宽到 20 分钟，
- *            用「App 开着但暂时没说话」不会被误判下线来近似。
+ *            站长 2026-11-12 定：**静默 5 分钟就算下线**（`WX_ONLINE_MS` 可调）。
  *
  * 🔴 只推「她本人」：extInfo.channelRole === '2'；跳过 LIVEPUSH（开播归本脚本的 live 分支管）。
  *
@@ -322,9 +321,10 @@ async function tickOne(w, st, lives, first) {
     log(`${w.nick} 查房间消息失败：` + next.err);
   }
 
-  /* ③ 上下线 —— 站长口径（2026-11-12 15:55 更新）：**「她开着 App 就算在线」**。
-     口袋48 不公开成员登录态，所以用「静默时长」近似：
-     静默 < `WX_ONLINE_MS`（默认 20 分钟）= 还在线；超了才算下线。
+  /* ③ 上下线 —— 站长口径（2026-11-12 18:5x 最终版）：**静默 5 分钟算下线**。
+     口袋48 不公开成员登录态（HTTP 接口没有在线字段，NIM 在线订阅被服务端功能开关挡住），
+     只能用「静默时长」近似：静默 < `WX_ONLINE_MS`（默认 5 分钟）= 还在线；超了才算下线。
+     （中途试过放宽到 20 分钟，站长要回到 5 分钟，2026-11-12 晚改回。）
      🔴 「下线时刻」不能写判定时刻，要写 `actT + ONLINE_MS`。
         Actions 每 5 分钟才起一个 job，判定往往晚十几分钟才发生，但群里该显示的是
         她真正停下的那一刻（站长给的样例 `13:51:07 上线 → [13:58:40] 下线 / 在线 7分33秒`
@@ -332,14 +332,11 @@ async function tickOne(w, st, lives, first) {
      🔴 跨 job 保护：每个 job 的**第一轮不做下线判定**（`first`）——
         上个 job 结束后有一段没人在看的空档，不能拿空档当「她走了」，
         否则每个 job 起头都会诈一句「下线了」。
-     🔴 上线通知 15 分钟冷却：她挂机不说话会被判下线、一动又判上线，
-        不冷却群消息会被刷成心电图。状态照记，只是不重复播报。
+     🔴 上线冷却 5 分钟（跟着阈值一起收窄）：阈值 5 分钟时，她静默 6 分钟会被判下线、
+        再说一句又判上线；冷却比阈值长太多会出现「只报下线不报上线」。
      🔴 太旧的离线（>30 分钟）只记状态不推送；夜间（北京 08:00 前）不推下线，免得吵人。 */
-  /* 🔴 2026-11-12 站长更新口径：「她开着 App 就算在线」。口袋48 不公开成员登录态
-     （HTTP 接口没有在线字段，只有云信 NIM 私有协议里有），所以只能用「静默多久算下线」来近似：
-     静默期从 5 分钟放宽到 **20 分钟**（`WX_ONLINE_MS` 可调）—— App 开着但只是不说话时不会被判下线，
-     真关掉 App 之后 20 分钟内也一定会报下线。 */
-  const ONLINE_MS = Math.max(60e3, Number(process.env.WX_ONLINE_MS) || 20 * 60e3);
+  const ONLINE_MS = Math.max(60e3, Number(process.env.WX_ONLINE_MS) || 5 * 60e3);
+  const ON_COOLDOWN_MS = Math.max(60e3, Math.min(ONLINE_MS, 5 * 60e3));
   const prevOnline = Number(st.online) === 1;
   /* 🔴 2026-11-12 修：原来上线判定要求「历史 actT 非空」，但 job 换机器时 actT 可能已被
      下线分支清成 0 / 或从没落地过 ⇒ 群里的「上线了」一条都发不出去（桥的已推记录 0 条 on:）。
@@ -353,7 +350,7 @@ async function tickOne(w, st, lives, first) {
     const hasLiveItem = items.some((x) => /^live:/.test(String(x.id)));
     if (!prevOnline && everSeen && !hasLiveItem) {
       const lastOn = Number(st.onPushT) || 0;
-      if (now - lastOn >= 15 * 60e3) {
+      if (now - lastOn >= ON_COOLDOWN_MS) {
         items.unshift({
           id: 'on:' + now,
           t: now,
