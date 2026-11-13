@@ -41,7 +41,12 @@ const CH = String(process.env.ROOM_CH || '2541547');
    否则两个人共用一个 roomT/liveId 会互相踩。
    env 写法（JSON 数组）：WATCHES=[{"uid":"89653517","nick":"王语晨","srv":"2278592","ch":"2541547"},…]
    不配时退回老的单成员 WATCH_UID/ROOM_*。 */
-const WATCHES = (() => {
+/* 🔴 名单的**真源在云端**（Worker KV `wxwatch:main`），这里只留一份 env 兜底。
+   2026-11-13 站长：「群里加成员的消息推送，可以在这个后台以及指令加吗」——
+   以前加人得改本文件上面的 WATCHES / workflow 里的 WATCHES，再推一次 commit；
+   现在站长在 `/admin` 后台或群里发「关注 王语晨」就生效，runner 每轮开跑先整份套用。
+   env 的 WATCHES 只在「云端读不到」时兜底（token 失效/GitHub 网络抽风）。 */
+const ENV_WATCHES = (() => {
   const raw = String(process.env.WATCHES || '').trim();
   if (raw) {
     try {
@@ -51,13 +56,37 @@ const WATCHES = (() => {
         nick: String(x.nick || x.name || '').trim(),
         srv: String(x.srv || '').trim(),
         ch: String(x.ch || '').trim(),
-      })).filter((x) => x.uid && x.nick && x.srv && x.ch);
+      })).filter((x) => x.uid && x.nick);
       if (ok.length) return ok;
-      console.warn('WATCHES 里没有一条完整（uid/nick/srv/ch 都要），退回单成员');
+      console.warn('WATCHES 里没有一条完整（uid/nick 至少要有），退回单成员');
     } catch (e) { console.warn('WATCHES 不是合法 JSON：' + e.message); }
   }
   return [{ uid: WATCH_UID, nick: NICK, srv: SRV, ch: CH }];
 })();
+let WATCHES = ENV_WATCHES;
+
+/** 从云端拉播报名单。拿不到（网络/鉴权/空表）就退回 env 兜底，绝不让抓取空转。 */
+async function watchLoad() {
+  try {
+    const r = await fetch(`${WORKER}/api/wxwatch`, {
+      headers: { 'x-ingest-token': INGEST }, signal: AbortSignal.timeout(15000),
+    });
+    const j = await r.json();
+    const list = (j && Array.isArray(j.list)) ? j.list : [];
+    const ok = list.map((x) => ({
+      uid: String((x && x.uid) || '').trim(),
+      nick: String((x && x.nick) || '').trim(),
+      srv: String((x && x.srv) || '').trim(),
+      ch: String((x && x.ch) || '').trim(),
+    })).filter((x) => x.uid && x.nick);
+    if (!ok.length) { log('云端播报名单是空的 ⇒ 用 env 兜底'); return ENV_WATCHES; }
+    log(`云端播报名单 ${ok.length} 人：` + ok.map((x) => x.nick).join('、'));
+    return ok;
+  } catch (e) {
+    log('拉云端播报名单失败，用 env 兜底：' + String((e && e.message) || e).slice(0, 80));
+    return ENV_WATCHES;
+  }
+}
 
 const RUN = Math.max(45, Number(process.env.RUN_SECONDS || 270)) * 1000;
 const EVERY = Math.max(10, Number(process.env.EVERY || 20)) * 1000;
@@ -266,6 +295,18 @@ async function tickOne(w, st, lives, first) {
         + (mins > 5 ? `已经播了 ${mins} 分钟\n` : '')
         + `https://h5.48.cn/2017/live/index.html?liveId=${cur.liveId}`);
       log(`开播 → ${cur.liveId} 「${cur.title}」`);
+    } else if (cur.liveId !== (st.liveId || '') && coldStart) {
+      /* 🔴 2026-11-13 站长：「关注了陈淑钰 在游戏群怎么没有推送」。
+         她 20:43 就开播，站长 23 点才关注 ⇒ 抓取端第一次看到她时已经播了 157 分钟，
+         按上面的 coldStart 规则整段静默，群里一条都没有，看起来就像关注没生效。
+         ⇒ 冷启动不诈「刚开播」，但要补一条「正在播」：新关注的成员在播必须让群里知道，
+           否则用户没法区分「她没播」和「推送坏了」。 */
+      const mins = Math.max(1, Math.round((startedAgo || 0) / 60000));
+      add('live:' + cur.liveId + ':now', Date.now(),
+        `【${w.nick}·正在播】${cur.title || '直播中'}\n`
+        + `已经播了 ${mins} 分钟\n`
+        + `https://h5.48.cn/2017/live/index.html?liveId=${cur.liveId}`);
+      log(`首次见到时已在播 ${mins} 分钟 → 推「正在播」（不发假开播）`);
     }
     active = true;                       // 在播 = 她肯定在线
     acts.push(Number(cur.ctime) || Date.now());   // 开播那一刻
@@ -291,12 +332,16 @@ async function tickOne(w, st, lives, first) {
     }
   }
 
-  /* ② 房间消息（只推她本人） */
+  /* ② 房间消息（只推她本人）
+     🔴 后台/指令加进来的成员可能还没有房间号（名册里 srv/ch 是 0）——
+        这种情况**只播开播/下播**，不要去拉房间（拉必报错，日志会被刷满，还白等超时）。 */
   const now = Date.now();
   // 游标为空（第一次跑）或落后太多 ⇒ 只补最近 10 分钟，绝不把整段历史倒进群
   const floor = now - 10 * 60e3;
   const since = Math.max(Number(st.roomT) || 0, floor);
-  try {
+  if (!w.srv || !w.ch) {
+    if (first) log(`${w.nick}：没有房间号（srv/ch），本轮只播开播/下播`);
+  } else try {
     const msgs = await collect(since, w);
     if (first) log(`${w.nick}：最近 10 分钟她有 ${msgs.length} 条本人发言`);
     if (msgs.length) {
@@ -407,6 +452,8 @@ async function tickOne(w, st, lives, first) {
 /* ---------------- 主循环 ---------------- */
 
 const until = Date.now() + RUN;
+/* 名单每轮都从云端套用（后台/群指令改了，下一轮 job 就生效，不用重新部署） */
+WATCHES = await watchLoad();
 log(`启动：盯 ${WATCHES.map((w) => w.nick + '(' + w.uid + ')').join('、')}，`
   + `跑 ${Math.round(RUN / 1000)} 秒，每 ${Math.round(EVERY / 1000)} 秒一次`);
 
