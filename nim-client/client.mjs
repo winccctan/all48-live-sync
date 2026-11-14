@@ -379,10 +379,117 @@ function wxClock(t) {
   return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
 }
 
+/* ---------------- 实时在线雷达（2026-11-14 站长：「APP 上下线」） ----------------
+ * 背景：口袋48 不公开成员登录态 ——
+ *   · REST 侧：`friendships/friends` 的 userInfo、`seine/server/detail` 的 chatServerInfo
+ *     全字段都翻过，没有任何 online / lastActiveTime / activeTime；
+ *   · 云信侧：14 事件服务（publishEvent/subscribeEvent/query）对该 appKey 全 403 + 空 body，
+ *     同一条连接上 2/2、6/23、24/1 全 200 ⇒ 是功能没对粉丝号开，不是组包问题；
+ *   · AppSecret 拿不到（客户端里本就没有，APK 还是 360 加固）。
+ *   ⇒ 「只是打开 App 一句话不说」这件事，任何第三方都拿不到（牙牙那个开源项目也没有）。
+ *
+ * 能做的：把「她的任何可观测动作」当成在线证据，并且**把观测面开满**：
+ *   以前只认「她自己房间的消息」—— 但长连接其实订了全团房间，
+ *   **她在别人房间发言、给别人送礼**同样收得到，以前白收了。
+ *   这里把这些全部算成心跳，并将判定搬到长连接（秒级，Actions 那侧是 5 分钟一轮）。
+ *
+ * 与 Actions 共存（wx-actions.mjs）：
+ *   · 上线 id 规则一致 `on:<首次动作t>`、下线 `off:<actT>`，桥按 id 去重；
+ *   · 每次翻转都把 state 推到 `/api/wxq/push`（u=uid），Actions 下一轮读到 online=1
+ *     就不会重复播报，也拿得到我们更新的 actT。
+ *   · 容器挂了就只剩 Actions，行为退回改之前的样子，不会更差。
+ */
+const WX_ONLINE_MS = Math.max(60e3, Number(process.env.WX_ONLINE_MS || 5 * 60e3));
+const WX_ON_COOLDOWN = Math.min(WX_ONLINE_MS, 5 * 60e3);
+const wxPresence = new Map();     // uid -> {online, onT, at, kind, onPushT, syncAt}
+const bjHMS = (t) => {
+  const d = new Date(t + BJ);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+};
+const fmtDur = (sec) => {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  return m ? `${m}分${s % 60}秒` : `${s}秒`;
+};
+
+function wxPresencePost(uid, s) {
+  const nick = WX_ROOM.get(uid);
+  if (!nick || !INGEST || WX_PUSH_OFF) return;
+  s.syncAt = Date.now();
+  fetch(SITE + '/api/wxq/push', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST },
+    body: JSON.stringify({
+      items: [], u: String(uid), who: nick,
+      state: {
+        online: s.online ? 1 : 0, onT: s.onT || 0, actT: s.at || 0,
+        lastKind: s.kind || 'action', nimAt: Date.now(), src: 'nim',
+      },
+    }),
+    signal: AbortSignal.timeout(12000),
+  }).catch((e) => log('[在线] 上报失败：' + String((e && e.message) || e).slice(0, 50)));
+}
+
+/** 她任何一个可观测动作都算在线心跳。kind: text/gift/live/small… */
+function wxTouch(uid, t, kind) {
+  const id = Number(uid) || 0;
+  const nick = WX_ROOM.get(id);
+  if (!nick) return;                       // 粉丝的动作一律不看，零开销
+  const nowAt = Date.now();
+  const at = Math.min(Number(t) || nowAt, nowAt);   // 服务端时间偶尔比本地快
+  let s = wxPresence.get(id);
+  if (!s) { s = { online: false, onT: 0, at: 0, kind: '', onPushT: 0, syncAt: 0 }; wxPresence.set(id, s); }
+  if (at < s.at - 60e3) return;            // 明显乱序的老消息，别拿它当时针
+  const wasOffline = !s.online;
+  if (at > s.at) { s.at = at; if (kind) s.kind = kind; }
+  if (wasOffline) {
+    s.online = true;
+    s.onT = s.at;
+    /* 冷却：她静默 6 分钟被我们判下线、又说一句 ⇒ 会连环报上下线。
+       跟 Actions 同口径（阈值 5 分钟时冷却也 5 分钟）。 */
+    if (s.at - (s.onPushT || 0) >= WX_ON_COOLDOWN) {
+      wxBuf.push({ id: 'on:' + s.at, t: s.at, who: nick, text: `💡${bjHMS(s.at)}${nick} 上线了` });
+      s.onPushT = s.at;
+      log(`[在线] ${nick} 上线 ${bjHMS(s.at)}（${kind || '动作'}）`);
+    }
+    wxPresencePost(id, s);
+    return;
+  }
+  if (nowAt - s.syncAt > 60e3) wxPresencePost(id, s);   // actT 刷新（节流 1 分钟一次）
+}
+
+/** 静默超阈值 ⇒ 下线。延迟最多 20 秒（定时器粒度），不再靠 5 分钟一轮的 Actions。 */
+function wxPresenceTick() {
+  const now = Date.now();
+  for (const [uid, s] of wxPresence) {
+    if (!s.online) continue;
+    if (now - s.at < WX_ONLINE_MS) continue;
+    const nick = WX_ROOM.get(uid) || '';
+    s.online = false;
+    const offT = s.at + WX_ONLINE_MS;          // 她真正停下的那一刻，不是判定时刻
+    const dur = Math.max(0, Math.round((offT - (s.onT || s.at)) / 1000));
+    const bjHour = new Date(offT + BJ).getUTCHours();
+    if (bjHour >= 8 && nick) {                 // 夜里不推下线，免得吵人（与 Actions 一致）
+      wxBuf.push({
+        id: 'off:' + s.at, t: offT, who: nick,
+        text: `🕑${bjHMS(offT)}${nick} 下线了\n在线时长${fmtDur(dur)}`,
+      });
+      log(`[在线] ${nick} 下线 ${bjHMS(offT)}（在线 ${fmtDur(dur)}）`);
+    } else {
+      log(`[在线] ${nick} 下线 ${bjHMS(offT)}（${bjHour < 8 ? '夜间不推' : '不在播报名单'}）`);
+    }
+    s.onT = 0;
+    wxPresencePost(uid, s);
+  }
+}
+setInterval(wxPresenceTick, 20e3);
+
 function wxQueue(uid, v, d) {
   if (!WX_ROOM.has(uid)) return;
   const nick = WX_ROOM.get(uid);
   const t = Number(v.t) || Number(d.time) || Date.now();
+  wxTouch(uid, t, v.k);      // 发言本身就是「人在线」的硬证据（任何房间都算）
   const head = `【${nick}·口袋房间】`;
   const txt = String(v.x || '').trim();
   if (txt) wxBuf.push({ id: `room:${uid}:${t}`, t, who: nick, text: `${head}${wxClock(t)}\n${txt}` });
@@ -658,6 +765,9 @@ function onRoomMessage(d) {
     pushMsg(d, p); return;   // 非礼物 = 发言（文字/语音/视频/图片/翻牌…）
   }
   stat.present++;
+  /* 她给别人送礼 = 她人在手机上（粉丝送给她不算：送礼人不是播报对象）。 */
+  const giverUid = Number((p.user && p.user.userId) || 0);
+  if (giverUid) wxTouch(giverUid, Number(d.time) || Date.now(), 'gift');
   const mid = srvToMid.get(String(d.serverId)) || 0;
   const item = giftFromExt(p.merged, {
     src: 0, liveId: '', roomId: d.channelId, fallbackMid: mid,

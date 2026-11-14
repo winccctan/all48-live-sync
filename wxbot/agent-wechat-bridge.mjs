@@ -365,7 +365,7 @@ async function loadCfg(verbose = false) {
     if (sig === cfgSig) { if (verbose) log('云端配置：无变化'); return true; }
     cfgSig = sig;
     log(`配置已下发（云端 v${x.v}）：指令群=${GROUPS.join(',') || '全部'}　`
-      + `推送=${[...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + (ws.join('|') || '全部')).join('，') || PUSH_GROUPS.join(',') || '关'}　`
+      + `推送=${[...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + wsDesc(ws)).join('，') || PUSH_GROUPS.join(',') || '关'}　`
       + `冷却=${COOLDOWN}ms　AI/天=${AI_DAILY}　取件=${Math.round(PUSH_EVERY / 1000)}s`);
     return true;
   } catch (e) {
@@ -2034,6 +2034,19 @@ async function pullOnce() {
   log(`取件 ${fresh.length} 条 → 排队 ${n} 份，待发 ${pullBacklog.size} 个群（轮转，一轮只发 1 个群）`);
 }
 
+/** 名单的人话版（日志/启动横幅用）。
+ *  🔴 以前写的是 `ws.join('|') || '全部'` —— 空数组被打印成「全部」，
+ *     排查「这个群还推不推」时看到全是「全部」，误判成空名单没生效（2026-11-14）。 */
+function wsDesc(ws) {
+  const a = Array.isArray(ws) ? ws : [];
+  if (!a.length) return '（不播）';
+  if (a.indexOf('*') >= 0) {
+    const blk = a.filter((x) => String(x).charAt(0) === '!').map((x) => String(x).slice(1));
+    return '全部' + (blk.length ? '｜屏蔽:' + blk.join(',') : '');
+  }
+  return a.join('|');
+}
+
 /** 把条目按「这是谁的动态」分派到群。返回 Map<群, items[]>（不落地）。
     🔴 按人过滤的口径全在这里：PUSH_MAP 没配时退回 PUSH_GROUPS（那群收所有人）。
     空数组 = 这个群**不播任何人**（想全收写 `["*"]`），否则取关到空会变回「全收」。
@@ -2045,7 +2058,11 @@ function jobsFor(items) {
     const who = String(it.who || '').trim();
     for (const g of targets) {
       const whos = PUSH_MAP.get(g) || [];
-      if (who && whos.indexOf('*') < 0 && whos.indexOf(who) < 0) continue;   // 这群不收她
+      if (who) {
+        const blocked = whos.indexOf('!' + who) >= 0;      // 全收群里被单独屏蔽的人
+        const all = whos.indexOf('*') >= 0;
+        if (blocked || (!all && whos.indexOf(who) < 0)) continue;   // 这群不收她
+      }
       if (!jobs.has(g)) jobs.set(g, []);
       jobs.get(g).push(it);
     }
@@ -2141,7 +2158,7 @@ async function sendGroup(g, its) {
 /** 长轮询：每 PUSH_EVERY 秒一次，永不退出；单次异常只记日志，不影响下一条 */
 async function pump() {
   const desc = PUSH_MAP.size
-    ? [...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + (ws.join('|') || '全部')).join('，')
+    ? [...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + wsDesc(ws)).join('，')
     : (PUSH_GROUPS.join(',') || '关（没配 WX_PUSH_GROUPS / WX_PUSH_MAP）');
   log(`推送通道：${desc}，每 ${Math.round(PUSH_EVERY / 1000)} 秒取件（一轮只发 1 个群，轮转，群间隔 ${GROUP_GAP / 1000}s）`);
   if (!PUSH_MAP.size && !PUSH_GROUPS.length) return;

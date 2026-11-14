@@ -483,6 +483,16 @@ async function tickOne(w, st, lives, first) {
      🔴 太旧的离线（>30 分钟）只记状态不推送；夜间（北京 08:00 前）不推下线，免得吵人。 */
   const ONLINE_MS = Math.max(60e3, Number(process.env.WX_ONLINE_MS) || 5 * 60e3);
   const ON_COOLDOWN_MS = Math.max(60e3, Math.min(ONLINE_MS, 5 * 60e3));
+  /* 🔴 2026-11-14：常驻长连接（nim-client）现在自己判上下线 ——
+     秒级（本侧 5 分钟一轮）、观测面更全（她在**任何房间**发言、给别人送礼都算心跳）。
+     它 60 秒内会刷一次 `nimAt`；只要它还活着（10 分钟内），本侧就完全不碰
+     online/onT/actT 三个字段：既不会重复播报，也不会把它的新 actT 覆盖回旧值。
+     client 一挂 nimAt 就停更，这里 10 分钟后自动接管，退化成改之前的行为。 */
+  const nimAlive = Number(st.nimAt) > 0 && Date.now() - Number(st.nimAt) < 10 * 60e3;
+  if (nimAlive) {
+    delete next.online; delete next.onT; delete next.actT;
+    if (first) log('上下线：常驻端在管（nimAt ' + Math.round((Date.now() - Number(st.nimAt)) / 1000) + ' 秒前），本侧跳过');
+  } else {
   const prevOnline = Number(st.online) === 1;
   /* 🔴 2026-11-12 修：原来上线判定要求「历史 actT 非空」，但 job 换机器时 actT 可能已被
      下线分支清成 0 / 或从没落地过 ⇒ 群里的「上线了」一条都发不出去（桥的已推记录 0 条 on:）。
@@ -534,6 +544,7 @@ async function tickOne(w, st, lives, first) {
       log(`下线（${stale ? '判定太晚' : '夜间'}，不推送）→ 在线 ${fmtDur(dur)}`);
     }
     next.onT = 0;
+  }
   }
 
   if (items.length) delete next.err;
