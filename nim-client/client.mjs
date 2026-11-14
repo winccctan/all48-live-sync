@@ -285,24 +285,21 @@ function viewFromNim(d, ext) {
       o.c = ['分享', s(src.title, src.postsTitle, src.text) || '分享', url(s(src.pic, src.cover, ''))];
       break;
     /* 2026-11-14 18:28 曾雪婷连发四条，微信里全是「[REPLY] 没有信息」（站长截图）。
-       原始包（同日 18:32 抓到的语音版，结构一致）：
-       { replyInfo: { replyText: 粉丝被翻的那句话, replyName: 粉丝昵称,
-                      voiceUrl: 她本人录的语音, duration: 7 },
-         messageType: 'AUDIO_REPLY' }
+       抓到的真实结构（两种，字段一致）：
+         文字 · {"replyInfo":{"replyText":"粉丝原话","replyName":"粉丝昵称","text":"她回的这句"}}
+         语音 · {"replyInfo":{"replyText":"粉丝原话","replyName":"粉丝昵称","voiceUrl":…,"duration":7}}
+       🔴 `text` 是**她说的**，`replyText` 是**粉丝原话**（第一版取反了，会把粉丝的话当成她的回复）。
        以前这个类型不在表里 ⇒ 正文挖不到 ⇒ 推出去只剩一行类型标记。
-       现在：`回 @粉丝：粉丝原话`，语音单独一条；真什么都没有就不推，不再发空壳。 */
+       现在：她的话 + 一行引用（↳ @粉丝：原话）；语音版的转写由 wxQueue 补在最前面。 */
     case 'AUDIO_REPLY': case 'VIDEO_REPLY': case 'REPLY': case 'REPLY_TEXT': {
       const ri = (src.replyInfo && typeof src.replyInfo === 'object') ? src.replyInfo : src;
-      const rn = s(ri.replyName, ri.nickName, ri.nick, '');
-      const rt = s(ri.replyText, ri.replyContent, ri.text, ri.content, body, '');
+      const rn = s(ri.replyName, ri.nickName, ri.nick, '');      // 被翻牌的粉丝
+      const quote = s(ri.replyText, ri.replyContent, '');        // 粉丝原话
+      const mine = s(ri.text, ri.content, body, '');             // 她本人的文字（纯语音翻牌时为空）
       o.a = url(s(ri.voiceUrl, ri.audio, ri.audioUrl, ''));
       o.v = url(s(ri.videoUrl, ri.video, ''));
-      const dur = Number(ri.duration) || 0;
-      o.x = (k === 'AUDIO_REPLY' || o.a ? '🎙 翻牌语音' : '💬 翻牌回复')
-        + (dur ? `（${dur}″）` : '')
-        + (rn ? `\n回 @${rn}：` : (rt ? '\n' : ''))
-        + rt;
-      if (!rn && !rt && !o.a && !o.v) return null;
+      o.x = [mine, quote ? `↳ @${rn || '粉丝'}：${quote}` : ''].filter(Boolean).join('\n');
+      if (!o.x && !o.a && !o.v) return null;
       break;
     }
     default: {
@@ -572,7 +569,8 @@ function wxQueue(uid, v, d) {
     void (async () => {
       const asr = await asrOf(voice);
       const line = asr ? `🎙 ${asr}` : '🎙 语音（转写失败，听原声）';
-      const body = (txt ? txt + '\n' : '') + line;
+      /* 语音在前：她说的话才是内容；引用（↳ @粉丝：原话）跟在后一行。 */
+      const body = line + (txt ? '\n' + txt : '');
       wxBuf.push({
         id: `room:${uid}:${t}`, t, who: nick,
         text: `${head}${wxClock(t)}\n${body}`,

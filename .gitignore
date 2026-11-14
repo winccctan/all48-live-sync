@@ -15,3 +15,7 @@ fb-runner.log
 fb-runner.log.1
 .fb-runner.pid
 .sse-state-*.json
+
+# 云信在线状态订阅：服务端凭据 + 事件日志（含 accid，绝不进 git）
+presence.env
+.cache/

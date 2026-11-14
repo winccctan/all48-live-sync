@@ -1,0 +1,12 @@
+{
+  "name": "all48-wxbot",
+  "private": true,
+  "type": "module",
+  "version": "1.0.0",
+  "description": "个人微信号桥：POST /push {text} → 指定微信群发言（给 live-notify.mjs 用）",
+  "dependencies": {
+    "wechaty": "^1.20.1",
+    "wechaty-puppet-padlocal": "^1.20.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>cc.wyc0518.all48-wxbot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>cd /Users/tansy/WorkBuddy/2026-10-14-14-13-54/all48-live-sync/wxbot &amp;&amp; export NO_PROXY='*' no_proxy='*' &amp;&amp; exec /usr/bin/caffeinate -i -s /Users/tansy/.workbuddy/binaries/node/versions/22.22.2-6/bin/node bot.mjs</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Users/tansy/Library/Logs/all48/wxbot.log</string>
+  <key>StandardErrorPath</key><string>/Users/tansy/Library/Logs/all48/wxbot.err</string>
+</dict></plist>
