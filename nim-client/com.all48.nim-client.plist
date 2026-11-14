@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.all48.nim-client</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>-s</string>
+    <string>/Users/tansy/.workbuddy/binaries/node/versions/22.22.2-6/bin/node</string>
+    <string>/Users/tansy/WorkBuddy/2026-10-14-14-13-54/all48-live-sync/nim-client/client.mjs</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/tansy/WorkBuddy/2026-10-14-14-13-54/all48-live-sync/nim-client</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Users/tansy/WorkBuddy/2026-10-14-14-13-54/all48-live-sync/nim-client/nim-client.log</string>
+  <key>StandardErrorPath</key><string>/Users/tansy/WorkBuddy/2026-10-14-14-13-54/all48-live-sync/nim-client/nim-client.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>NO_PROXY</key><string>*</string>
+    <!-- 2026-11-14 先只跑「微信实时推送」：礼物/等级仍由 Actions 采集，
+         避免两条通道同时上报造成红蓝重复计分。确认无重复后再放开这两个开关。 -->
+    <key>NO_GIFT</key><string>1</string>
+    <key>NO_LV</key><string>1</string>
+    <key>WX_ROOM_UIDS</key><string>89653517:王语晨,45285685:黄宣绮</string>
+  </dict>
+</dict>
+</plist>
