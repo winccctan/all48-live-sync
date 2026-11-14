@@ -1891,6 +1891,8 @@ async function say(chat, text, tag) {
  *   · 同一张图（重推/补发）用 md5 命名，命中缓存就不再下第二次；
  *   · 云信 CDN 偶尔 403/超时，失败只记日志、不阻塞后续文本，绝不因一张图拖垮整批。 */
 const IMG_DIR = String(process.env.WX_IMG_DIR || `${XDG}/wxbot-img`);
+/* 语音原声缓存（只在转文字失败时才走到这里） */
+const VOICE_DIR = String(process.env.WX_VOICE_DIR || `${XDG}/wxbot-voice`);
 async function sayImage(chat, url) {
   const u = String(url || '').trim();
   if (!/^https?:\/\//i.test(u)) return false;
@@ -2004,7 +2006,7 @@ async function pullOnce() {
   if (!d || !d.ok) { log('取件失败：' + String(JSON.stringify(d)).slice(0, 120)); return; }
 
   const items = (Array.isArray(d.items) ? d.items : [])
-    .filter((x) => x && x.id && (String(x.text || '').trim() || String(x.img || '').trim()));
+    .filter((x) => x && x.id && (String(x.text || '').trim() || String(x.img || '').trim() || String(x.voice || '').trim()));
 
   /* 冷启动：队列里压着的旧东西一律不发，只放最近 15 分钟进来的 */
   const floor = Date.now() - PUSH_BOOT_FRESH;
@@ -2103,6 +2105,37 @@ async function flushOne() {
   return 'empty';
 }
 
+/** 发语音原声（只在转文字失败时才走这里 —— 2026-11-14 站长要「语音直接转文字」）。
+ *  🔴 容器原来没有媒体编码器，`--voice` 直接报 `media_encoder_unavailable`；
+ *     装 ffmpeg（5.1.9）之后同一份 aac 能发出去（filehelper 实测 messageIds 有值）。
+ *     ⚠️ 转写成功时**不发**原声：群里语音一条条弹出来太吵，文字才是内容。 */
+async function sayVoice(chat, url) {
+  const u = String(url || '').trim();
+  if (!/^https?:\/\//i.test(u)) return false;
+  if (DRY) { log(`[dry] 会发语音 ${chat}：${u.slice(0, 60)}`); return true; }
+  try {
+    mkdirSync(VOICE_DIR, { recursive: true });
+    const ext = ((/\.(aac|mp3|m4a|wav|amr|silk)(?:\?|#|$)/i.exec(u) || [])[1] || 'aac').toLowerCase();
+    const file = `${VOICE_DIR}/${createHash('md5').update(u).digest('hex').slice(0, 16)}.${ext}`;
+    if (!existsSync(file)) {
+      const r = await fetch(u, { signal: AbortSignal.timeout(30000) });
+      if (!r.ok) { log(`语音下载失败 HTTP ${r.status}：${u.slice(0, 60)}`); return false; }
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length < 500) { log('语音太小，丢弃：' + u.slice(0, 60)); return false; }
+      writeFileSync(file, buf);
+    }
+    const gap = Date.now() - (lastSent.get(chat) || 0);
+    if (gap < COOLDOWN) await sleep(COOLDOWN - gap);
+    lastSent.set(chat, Date.now());
+    await wx(['--account', ACCOUNT, '--json', 'messages', 'send', chat, '--voice', file, '--wait', '120'], 160000);
+    log(`已发语音 ${chat}：${file.split('/').pop()}`);
+    return true;
+  } catch (e) {
+    log('发语音失败：' + String((e && e.message) || e).slice(0, 140));
+    return false;
+  }
+}
+
 /** 真正发一个群：合并文本 + 补发图片。 */
 async function sendGroup(g, its) {
   /* 同一个群一轮的多条合成一条发：她有时连发五六句，逐条发会把群刷满。
@@ -2110,6 +2143,7 @@ async function sendGroup(g, its) {
      图片条目 text 为空（只有 img），拼文本时跳过，别拼出一堆空行。 */
   const texts = its.map((x) => String(x.text || '')).filter((t) => t.trim());
   const imgs = its.map((x) => String(x.img || '').trim()).filter(Boolean);
+  const voices = its.map((x) => String(x.voice || '').trim()).filter(Boolean);
   const text = (texts.length === 1 ? texts[0] : texts.join('\n\n')).slice(0, 1700);
 
   /* 🔴 测试/自检文案**永远不进群**（站长 2026-11-12：「这个出现在哪几个群就不要一起发了 不太好哈」）。
@@ -2150,6 +2184,12 @@ async function sendGroup(g, its) {
   for (const im of imgs) {
     const gi = await sayImage(g, im);
     if (!gi) log(`图片没发出去（${g}）`);
+    await sleep(600);
+  }
+  /* 图片之后补语音原声（转写失败的才带 voice 字段） */
+  for (const vo of voices) {
+    const gv = await sayVoice(g, vo);
+    if (!gv) log(`语音没发出去（${g}）`);
     await sleep(600);
   }
   return ok ? 'ok' : 'failed';

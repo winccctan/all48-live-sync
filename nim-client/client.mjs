@@ -284,9 +284,30 @@ function viewFromNim(d, ext) {
     case 'SHARE_POSTS':
       o.c = ['分享', s(src.title, src.postsTitle, src.text) || '分享', url(s(src.pic, src.cover, ''))];
       break;
+    /* 2026-11-14 18:28 曾雪婷连发四条，微信里全是「[REPLY] 没有信息」（站长截图）。
+       原始包（同日 18:32 抓到的语音版，结构一致）：
+       { replyInfo: { replyText: 粉丝被翻的那句话, replyName: 粉丝昵称,
+                      voiceUrl: 她本人录的语音, duration: 7 },
+         messageType: 'AUDIO_REPLY' }
+       以前这个类型不在表里 ⇒ 正文挖不到 ⇒ 推出去只剩一行类型标记。
+       现在：`回 @粉丝：粉丝原话`，语音单独一条；真什么都没有就不推，不再发空壳。 */
+    case 'AUDIO_REPLY': case 'VIDEO_REPLY': case 'REPLY': case 'REPLY_TEXT': {
+      const ri = (src.replyInfo && typeof src.replyInfo === 'object') ? src.replyInfo : src;
+      const rn = s(ri.replyName, ri.nickName, ri.nick, '');
+      const rt = s(ri.replyText, ri.replyContent, ri.text, ri.content, body, '');
+      o.a = url(s(ri.voiceUrl, ri.audio, ri.audioUrl, ''));
+      o.v = url(s(ri.videoUrl, ri.video, ''));
+      const dur = Number(ri.duration) || 0;
+      o.x = (k === 'AUDIO_REPLY' || o.a ? '🎙 翻牌语音' : '💬 翻牌回复')
+        + (dur ? `（${dur}″）` : '')
+        + (rn ? `\n回 @${rn}：` : (rt ? '\n' : ''))
+        + rt;
+      if (!rn && !rt && !o.a && !o.v) return null;
+      break;
+    }
     default: {
-      // 翻牌 / 卡片 / AI 对话 / 新图片类型 …：尽量把可读文本挖出来
-      const x = s(src.answer, src.text, src.content, src.desc, src.title, src.question, '');
+      // 翻牌 / 卡片 / AI 对话 / 新图片类型 …：尽量把可读文本挖出来（body 也算，很多类型正文就放这儿）
+      const x = s(src.answer, src.text, src.content, src.desc, src.title, src.question, body, '');
       o.a = url(s(src.audio, src.audioUrl, ''));
       o.v = url(s(src.video, src.videoUrl, ''));
       if (src.pic || src.cover || src.url) o.i = [url(s(src.pic, src.cover, src.url))];
@@ -297,7 +318,12 @@ function viewFromNim(d, ext) {
          真的什么内容都没有，才留类型标记（这类才算真未知，值得看一眼）。 */
       if (typeof x === 'string' && x) { o.x = x; }
       else if (o.i || o.a || o.v) { o.x = ''; if (k === 'UNKNOWN') o.k = o.i ? 'IMAGE' : (o.a ? 'AUDIO' : 'VIDEO'); }
-      else { msgUnknown += 1; o.x = '[' + (LABEL[k] || k) + ']'; }
+      else {
+        msgUnknown += 1; o.x = '[' + (LABEL[k] || k) + ']';
+        /* 2026-11-14 18:28 曾雪婷那条 REPLY 推到微信是「[REPLY] 没有信息」：
+           类型在表外、正文挖不出来。这里把原始 attachment 打一行，拿到结构就补 case。 */
+        if (msgUnknown <= 40) log('[DUMP]', k, String(d.attachment || '').slice(0, 1000));
+      }
       break;
     }
   }
@@ -485,6 +511,53 @@ function wxPresenceTick() {
 }
 setInterval(wxPresenceTick, 20e3);
 
+/* 重启后把云端在线状态接回来。
+ * 为什么必须有：容器/进程一重启，内存里的 lastAct 全空 ⇒ 她「1 分钟前刚说过话」会被
+ * 当成刚上线，群里诈一条「上线了」；反过来已经在线的也会被当成离线再补一条下线。
+ * 恢复失败不影响功能，只是这一轮可能多一条假播报。 */
+async function wxPresenceRestore() {
+  if (!INGEST) return;
+  for (const [uid, nick] of WX_ROOM) {
+    try {
+      const r = await fetch(`${SITE}/api/wxq/state?u=${uid}`, {
+        headers: { 'x-ingest-token': INGEST }, signal: AbortSignal.timeout(8000),
+      });
+      const j = await r.json().catch(() => null);
+      const s0 = (j && j.state) || {};
+      const at = Number(s0.actT) || 0;
+      if (!at) continue;
+      const cur = wxPresence.get(uid);
+      if (cur && cur.at >= at) continue;          // 内存里的更新，别拿旧状态盖回去
+      wxPresence.set(uid, {
+        online: Number(s0.online) === 1 && Date.now() - at < WX_ONLINE_MS,
+        onT: Number(s0.onT) || at, at,
+        kind: String(s0.lastKind || 'restore'),
+        onPushT: Number(s0.onT) || at, syncAt: 0,
+      });
+      log(`[在线] 恢复 ${nick}：${Number(s0.online) === 1 ? '在线' : '离线'}，最后动作 ${bjHMS(at)}`);
+    } catch { /* 忽略：恢复失败只是可能多一条播报 */ }
+  }
+}
+if (INGEST) setTimeout(() => { void wxPresenceRestore(); }, 6000);
+
+/* 语音转文字（2026-11-14 站长：「能语音直接转文字吗」）。
+ * 本机常驻服务 /app/asr/asr-server.mjs（Paraformer 中文模型，不调外部 API），
+ * 只听 127.0.0.1，超时 20 秒；失败就返回空串，调用方退回发语音原声。
+ * 🔴 转写会慢 1–3 秒，但队列本来就是每 10 秒 pump 一次，不影响及时性；
+ *    同一条语音被 Actions 和长连接各看到一次也无所谓，服务端按 URL 缓存。 */
+const ASR_URL = process.env.ASR_URL || 'http://127.0.0.1:8799/asr';
+async function asrOf(u) {
+  if (!/^https?:\/\//i.test(String(u || ''))) return '';
+  try {
+    const r = await fetch(ASR_URL, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: String(u) }), signal: AbortSignal.timeout(20000),
+    });
+    const j = await r.json().catch(() => null);
+    return (j && j.ok && j.text) ? String(j.text).trim() : '';
+  } catch { return ''; }
+}
+
 function wxQueue(uid, v, d) {
   if (!WX_ROOM.has(uid)) return;
   const nick = WX_ROOM.get(uid);
@@ -492,6 +565,24 @@ function wxQueue(uid, v, d) {
   wxTouch(uid, t, v.k);      // 发言本身就是「人在线」的硬证据（任何房间都算）
   const head = `【${nick}·口袋房间】`;
   const txt = String(v.x || '').trim();
+  /* 语音：先转文字，转出来只发文字（她说的话就是内容）；
+     转不出来才发原声（桥用 wx messages send --voice），保证不丢信息。 */
+  const voice = String(v.a || '').trim();
+  if (voice) {
+    void (async () => {
+      const asr = await asrOf(voice);
+      const line = asr ? `🎙 ${asr}` : '🎙 语音（转写失败，听原声）';
+      const body = (txt ? txt + '\n' : '') + line;
+      wxBuf.push({
+        id: `room:${uid}:${t}`, t, who: nick,
+        text: `${head}${wxClock(t)}\n${body}`,
+        voice: asr ? '' : voice,
+      });
+      log(`[WX] 入队 ${nick} ${v.k} ${line.slice(0, 26)}`);
+    })();
+    return;
+  }
+
   if (txt) wxBuf.push({ id: `room:${uid}:${t}`, t, who: nick, text: `${head}${wxClock(t)}\n${txt}` });
   /* 图片单独成条、text 留空（与 Actions 同口径）：桥拿到 img 才下载真发一张；
      合进文本里发不出去，URL 贴出来就是一行丑链接。 */
