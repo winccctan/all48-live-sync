@@ -133,14 +133,19 @@ async function stateGet(uid) {
 }
 
 async function push(items, state, who) {
+  /* 小房间发言额外带一份给 worker 留档（KV `smj:<uid>`，只给群指令 `xfj?` 用）。
+     🔴 不进队列、不进网页：队列是「取件即清空」，事后查不了，所以必须单独留档。 */
+  const sm = (who && Array.isArray(who.sm)) ? who.sm : [];
+  if (who) delete who.sm;
   if (DRY) {
     for (const it of items) log('[DRY] 会推：' + it.text.replace(/\n/g, ' / '));
+    for (const s of sm) log('[DRY] 小房间留档：' + bjTime(s.t) + ' ' + String(s.x).slice(0, 40));
     log('[DRY] state =', JSON.stringify(state));
     return;
   }
   const r = await fetch(`${WORKER}/api/wxq/push`, {
     method: 'POST', headers: HDR,
-    body: JSON.stringify({ items, state, u: who && who.uid, who: who && who.nick }),
+    body: JSON.stringify({ items, state, u: who && who.uid, who: who && who.nick, sm }),
     signal: AbortSignal.timeout(20000),
   });
   if (!r.ok) throw new Error('投递 HTTP ' + r.status);
@@ -287,6 +292,8 @@ async function smallChannels(w) {
 
 async function tickOne(w, st, lives, first) {
   const items = [];
+  /* 小房间发言留档（给群指令 `xfj?` 查）：本轮拉到什么就带上什么，随 push 一起交上去 */
+  const smOut = [];
   const next = { ...st };
   /* 「她有没有动作」——本轮只要发现开播/下播/新消息/翻牌就算 true。
      这是「上线」判定的唯一依据（口袋48 不公开登录态，只能看动作）。 */
@@ -430,6 +437,11 @@ async function tickOne(w, st, lives, first) {
         for (const im of msgs.filter((x) => x.img)) {
           add('smallimg:' + w.uid + ':' + sc.ch + ':' + im.t, im.t, '', im.img);
         }
+        /* 同一批发给 worker 留档（`xfj?` 查历史用）。带频道号 + 频道名，
+           一个成员有两个以上小房间时，回复里能分得清是哪间。 */
+        for (const it of msgs) {
+          smOut.push({ t: it.t, x: String(it.text || '').slice(0, 300), c: sc.ch, cn: String(sc.name || '').slice(0, 20) });
+        }
       } else if (!st[key] || Number(st[key]) < floor) {
         next[key] = now;
       }
@@ -510,6 +522,7 @@ async function tickOne(w, st, lives, first) {
 
   if (items.length) delete next.err;
   next.at = Date.now();
+  if (smOut.length) w.sm = smOut;
   await push(items, next, w);
   return next;
 }
