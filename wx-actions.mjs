@@ -271,7 +271,9 @@ async function smallChannels(w) {
     const c = (j && j.content) || {};
     list = (c.channelInfoList || [])
       .map((x) => ({ ch: String(x.channelId || ''), name: String(x.channelName || '') }))
-      .filter((x) => x.ch && x.ch !== String(w.ch));
+      /* 🔴 站长口径（2026-11-14）：「小房间应该是第二个频道」——
+         channelInfoList 第 1 个是大房间（= 名册里的 ch），第 2 个才是小房间。 */
+      .filter((x, i) => x.ch && i > 0 && x.ch !== String(w.ch));
   } catch (e) {
     log(`${w.nick} 查小房间失败（本轮只播大房间）：` + String((e && e.message) || e).slice(0, 70));
   }
