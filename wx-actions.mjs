@@ -396,13 +396,13 @@ async function tickOne(w, st, lives, first) {
     if (first) log(`${w.nick}：最近 10 分钟她有 ${msgs.length} 条本人发言`);
     if (msgs.length) {
       const newest = msgs[msgs.length - 1].t;
-      if (msgs.length === 1) {
-        add('room:' + w.uid + ':' + msgs[0].t, msgs[0].t,
-          `【${w.nick}·口袋房间】${bjTime(msgs[0].t)}\n${msgs[0].text}`);
-      } else {
-        const lines = msgs.map((it) => `${bjTime(it.t, false)}  ${it.text}`).join('\n');
-        add('room:' + w.uid + ':' + newest, newest,
-          `【${w.nick}·口袋房间】${msgs.length} 条新消息\n${lines}`);
+      /* 🔴 2026-11-14 站长：「消息不要一起发，不应该有消息就马上发吗」。
+         原先多条合并成一条「N 条新消息」的文本，她连着刷屏时就变成一坨，
+         群里看起来既像延迟又像刷屏。改成**逐条入队**（每条各自一个 id），
+         桥按 t 顺序一条一条发，来一条就是一条。 */
+      for (const it of msgs) {
+        add('room:' + w.uid + ':' + it.t, it.t,
+          `【${w.nick}·口袋房间】${bjTime(it.t)}\n${it.text}`);
       }
       next.roomT = newest;
       active = true;                       // 有新发言 = 她在线
@@ -436,13 +436,10 @@ async function tickOne(w, st, lives, first) {
       if (msgs.length) {
         const newest = msgs[msgs.length - 1].t;
         const label = `【${w.nick}·小房间】`;
-        if (msgs.length === 1) {
-          add('small:' + w.uid + ':' + sc.ch + ':' + msgs[0].t, msgs[0].t,
-            `${label}${bjTime(msgs[0].t)}\n${msgs[0].text}`);
-        } else {
-          const lines = msgs.map((it) => `${bjTime(it.t, false)}  ${it.text}`).join('\n');
-          add('small:' + w.uid + ':' + sc.ch + ':' + newest, newest,
-            `${label}${msgs.length} 条新消息\n${lines}`);
+        /* 小房间同样逐条发（理由同 ②：不再合并成一坨「N 条新消息」） */
+        for (const it of msgs) {
+          add('small:' + w.uid + ':' + sc.ch + ':' + it.t, it.t,
+            `${label}${bjTime(it.t)}\n${it.text}`);
         }
         next[key] = newest;
         active = true;
