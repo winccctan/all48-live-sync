@@ -249,7 +249,9 @@ async function fetchLiveList() {
     liveId: String(x.liveId || ''),
     uid: String((x.userInfo && x.userInfo.userId) || ''),
     nick: String((x.userInfo && x.userInfo.nickname) || ''),
-    online: Number(x.onlineNum || 0),
+    /* 🔴 列表里的在线数字段名是 `onlineUserNum`（不是 onlineNum！）。
+       2026-11-15 实测：72 场全部非零，且与 getLiveOne 的 onlineNum 差 1~2（更实时）。 */
+    online: Number(x.onlineUserNum || x.onlineNum || 0),
     ctime: Number(x.ctime || 0),
     status: Number(x.status || 0),
   })).filter((x) => x.liveId);
@@ -394,6 +396,29 @@ class Room {
     this.dumped = 0;
     this.samples = 0;
     this.deadAttempts = 0;
+    /* 最近的「进入房间」昵称（`nb?成员` 用）。只留内存最近 60 个，随在播快照上报。
+       🔴 这不是完整观众名单：只有我们全程连着的房间才收得到，且离开/刷新会漏。 */
+    this.peers = [];
+  }
+
+  /** 记录一个进入房间的昵称；leave 类通知不算 */
+  addPeer(nick, type) {
+    const n = String(nick || '').trim();
+    if (!n || n.length > 24) return;
+    const t = String(type || '').toLowerCase();
+    if (t === 'leave' || t === 'exit' || t === 'quit') return;
+    if (this.peers[this.peers.length - 1] === n) return;   // 同一人连发两条一样的通知
+    this.peers.push(n);
+    if (this.peers.length > 60) this.peers = this.peers.slice(-60);
+  }
+
+  /** 成员进出事件（不同 SDK 版本字段不一样，都兜一遍） */
+  onMembers(ev) {
+    const arr = (ev && (ev.members || ev.memberList)) || [];
+    const type = (ev && (ev.type || ev.eventType)) || '';
+    if (Array.isArray(arr)) {
+      for (const m of arr) this.addPeer((m && (m.nick || m.nickname || m.name)) || '', type);
+    }
   }
 
   async enter() {
@@ -402,6 +427,8 @@ class Room {
         const one = await fetchRoomId(this.liveId);
         this.roomId = one.roomId;
         this.title = one.title;
+        /* 详情页的在线人数比列表更准（进房那一刻的值），`nb?` 优先用它 */
+        if (one.online) this.online = one.online;
       } catch (e) {
         warn(`[${this.nick || this.liveId}] getLiveOne 失败：${String(e.message).slice(0, 80)}`);
         this.state = 'down';
@@ -434,6 +461,8 @@ class Room {
         db: false,
         // 🔴 onmsg 是 Chatroom 实例的正式回调名，on('message') 是兼容写法；两条都挂，靠 msgid 去重
         onmsg(msg) { self.handle(msg); },
+        // 成员进出（粉丝昵称来源）。SDK 版本不同名不一样，再在下面挂 on('members')
+        onmembers(ev) { self.onMembers(ev); },
         onconnect() {
           self.state = 'on';
           self.connects++;
@@ -460,6 +489,7 @@ class Room {
       });
       // 兼容写法（不同版本 SDK 事件名不一样，多挂不亏）
       try { this.chatroom.on?.('message', (msg) => self.handle(msg)); } catch { /* noop */ }
+      try { this.chatroom.on?.('members', (ev) => self.onMembers(ev)); } catch { /* noop */ }
       stat.lastConnectAt = Date.now();
     } catch (e) {
       warn(`[${this.nick || this.liveId}] 进房异常：${String(e.message).slice(0, 120)}`);
@@ -538,6 +568,37 @@ class Room {
 
 /* ------------------------------------------------------- ⑦ 在播扫描 / 调度 */
 
+/* 在播快照上报（`nb?` 的数据源）：每 3 分钟把 getLiveList 的整份在播列表推到 R2 `live:now`。
+ * 🔴 只报「场次 id / 昵称 / 在线数 / 开播时间 / 最近进入的昵称」，不含任何 uid。
+ * 🔴 3 分钟节流：scan 是 60 秒一轮，但 R2/KV 写入没必要那么勤，人数在这个粒度上够用。 */
+let liveNowAt = 0;
+async function flushLiveNow(list) {
+  if (DRY || !SITE || !list || !list.length) return;
+  if (Date.now() - liveNowAt < 3 * 60 * 1000) return;
+  liveNowAt = Date.now();
+  const lives = list.map((x) => {
+    const ct = Number(x.ctime) || 0;
+    const room = rooms.get(x.liveId);
+    return {
+      id: String(x.liveId),
+      nick: String(x.nick || '').slice(0, 40),
+      /* 进过房的用 getLiveOne 的值（更准），没进的退回列表的 onlineUserNum */
+      online: Number((room && room.online) || x.online) || 0,
+      t0: ct > 0 ? (ct < 1e12 ? ct * 1000 : ct) : 0,
+      peers: (room && Array.isArray(room.peers)) ? room.peers.slice(-40) : [],
+    };
+  });
+  try {
+    await site('/api/live/now', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-ingest-token': INGEST, 'user-agent': 'all48-live-nim/1.0' },
+      body: JSON.stringify({ lives }),
+    }, { timeout: 20000, retries: 1 });
+  } catch (e) {
+    warn('在播快照上报失败：' + String(e.message).slice(0, 80));
+  }
+}
+
 async function scanOnce() {
   stat.scans++;
   stat.lastScanAt = Date.now();
@@ -557,6 +618,8 @@ async function scanOnce() {
     return;
   }
   log(`在播 ${list.length} 场`);
+  /* 顺手把整份在播列表（含在线人数）推给站点，供 `nb?` 查询（3 分钟节流） */
+  await flushLiveNow(list);
 
   // 已经下播的：离房
   const liveSet = new Set(list.map((x) => x.liveId));

@@ -1,0 +1,45 @@
+# 在播在线人数（`nb?` 的数据源）
+#
+# 为什么单独一条：
+#   `nb?` 要的是「此刻谁在播、多少人看」，这是**秒级就过期**的数据，不能靠一小时的批处理。
+#   数据完全来自我们自己的口袋48 官方接口 `getLiveList`（onlineUserNum），
+#   不经过任何第三方站点。
+#
+# 🔴 与 live-fast / perf 那些 job 的区别：这条只读一次列表 + 一次 POST，3~5 秒跑完，
+#    不下载任何弹幕、不碰流水，所以 5 分钟一轮也不心疼 Actions 配额（public 仓库免费）。
+# 🔴 只推「场次 id / 昵称 / 在线数 / 开播时间」，不含 uid。
+# 🔴 粉丝昵称（peers）不在这里采 —— 那要长连接听成员进出，只有 live-nim-sync.mjs 有。
+name: 在播在线人数
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-now
+  cancel-in-progress: true
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 拉在播列表并上报在线人数
+        run: node live-now-push.mjs
+        env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          POCKET48_TOKEN: ${{ secrets.POCKET48_TOKEN }}
+          SCRAPE_PROXY: ${{ secrets.SCRAPE_PROXY }}
