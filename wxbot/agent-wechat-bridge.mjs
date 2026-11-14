@@ -22,7 +22,7 @@
  *   node wxbot/agent-wechat-bridge.mjs --ping     # 自检：拉一次 /api/cmd 验证 token
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname } from 'node:path';
 
@@ -32,11 +32,19 @@ const XDG = String(process.env.XDG_CONFIG_HOME || '/tmp/awcfg');   // 🔴 必�
 const WORKER = (process.env.WORKER_URL || 'https://all48-archive.yqz-tansy.workers.dev').replace(/\/+$/, '');
 const KEY = String(process.env.WX_QUEUE_TOKEN || '');
 /** 允许的群：chatroom id（如 53524154991@chatroom），逗号分隔；留空 = 所有群 */
-const GROUPS = String(process.env.WX_GROUPS || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+let GROUPS = String(process.env.WX_GROUPS || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
 /** 是否必须 @ 本号才响应。默认 0 = 不需要 @（站长 2026-11-12 要求） */
-const REQUIRE_MENTION = String(process.env.WX_REQUIRE_MENTION || '0') === '1';
+let REQUIRE_MENTION = String(process.env.WX_REQUIRE_MENTION || '0') === '1';
 const CURSOR = String(process.env.WX_CURSOR_FILE || `${XDG}/wxbot-cursor`);
-const COOLDOWN = Math.max(500, Number(process.env.WX_COOLDOWN || 1500));
+/* 🔴 启动锚点。2026-11-12 23:00 线上事故：`START_AT` / `SILENT_UNTIL` 只在 handle() 里被引用，
+   从来没有定义过 ⇒ 每条消息进来第一件事就 ReferenceError，整条被静默丢掉，
+   表现就是「机器人在线、但一个字都不回」（比报错更难查）。
+   · START_AT：启动时刻，用来丢掉「启动前 2 分钟以外」的历史消息；
+   · SILENT_UNTIL：**没有游标文件**（新机器 / 游标丢了）时前 3 分钟只记录不回复，
+     否则 wx 会把整批历史消息重放一遍，机器人逐条回 = 群里刷屏。 */
+const START_AT = Date.now();
+const SILENT_UNTIL = existsSync(CURSOR) ? 0 : Date.now() + 3 * 60 * 1000;
+let COOLDOWN = Math.max(500, Number(process.env.WX_COOLDOWN || 1500));
 const DRY = process.argv.includes('--dry');
 const PING = process.argv.includes('--ping');
 
@@ -56,7 +64,7 @@ const AI_BASE = String(process.env.AI_BASE || 'https://api.deepseek.com/v1').rep
 const AI_MODEL = String(process.env.AI_MODEL || 'deepseek-chat');
 const AI_VIA_WORKER = !AI_KEY;          // 没有外部 key 就走 worker
 const AI_ON = !!AI_KEY || !!KEY;
-const AI_DAILY = Math.max(1, Number(process.env.AI_DAILY || 120));
+let AI_DAILY = Math.max(1, Number(process.env.AI_DAILY || 120));
 const AI_CTX_TTL = 5 * 60 * 1000;
 
 /* ── 王语晨动态推送（2026-11-12）────────────────────────────────────
@@ -68,12 +76,12 @@ const AI_CTX_TTL = 5 * 60 * 1000;
       「重生之要当富豪榜前」只让它查询、不让它播报；「bot小群」同理 —— 站长明确「其他群不推」。
    🔴 为什么不在本机直接怼口袋48：Actions 那条已经把游标、开播防抖（连续 3 次不在列表才算下播）、
       冷启动保护（播了 >30 分钟不诈「开播」）都做好了，本机再写一套必然两边打架。 */
-const PUSH_GROUPS = String(process.env.WX_PUSH_GROUPS || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+let PUSH_GROUPS = String(process.env.WX_PUSH_GROUPS || '').split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
 /** 群 → 该群要收**谁**的动态（2026-11-12 站长：「bot小群对接黄宣绮」「游戏群、bot小群2 收王语晨」）。
  *  env 写法：`WX_PUSH_MAP=53524154991@chatroom=王语晨,54162053602@chatroom=王语晨,57498523864@chatroom=黄宣绮`
  *  一个群收多人用 `|`：`…=王语晨|黄宣绮`。
  *  🔴 配了 MAP 就只看 MAP（比 WX_PUSH_GROUPS 优先）；没配才退回老行为（这些群收所有人）。 */
-const PUSH_MAP = (() => {
+let PUSH_MAP = (() => {
   const m = new Map();
   const raw = String(process.env.WX_PUSH_MAP || '').trim();
   for (const part of raw.split(/[,\s]+/).filter(Boolean)) {
@@ -85,7 +93,7 @@ const PUSH_MAP = (() => {
   }
   return m;
 })();
-const PUSH_EVERY = Math.max(3000, Number(process.env.WX_PUSH_EVERY || 6000));
+let PUSH_EVERY = Math.max(3000, Number(process.env.WX_PUSH_EVERY || 6000));
 const PUSH_SEEN_FILE = String(process.env.WX_PUSH_SEEN || `${XDG}/state/wxpush-seen.json`);
 const PUSH_SEEN_MAX = 400;              // 只留最近 400 个 id（够兜住几天的重复）
 /** 首次启动只补最近 15 分钟 —— 队列里可能压着几小时前的历史，倒进群等于刷屏 */
@@ -100,6 +108,27 @@ const log = (...a) => {
   try { mkdirSync(dirname(LOG_FILE), { recursive: true }); appendFileSync(LOG_FILE, line + '\n'); } catch { }
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 消息时间 → 毫秒时间戳。
+ *  🔴 这个函数之前**只被调用、从未定义**（我在「历史消息不重放」那次改动里凭记忆写了一行
+ *     `msgTimeMs(m)`）。结果每条群消息都在这里 ReferenceError 被 catch 吞掉：
+ *     指令全哑、推送照常（推送走 pump，不经过 handle）。2026-11-13 修。
+ *  agent-wechat 不同版本给的字段/单位都不同：createTime 可能是**秒**、可能是**毫秒**、也可能是字符串。
+ *  换算错会让所有消息被判成「历史」而静默丢弃，所以这里必须按数量级判断，不能瞎乘。 */
+function msgTimeMs(m) {
+  if (!m || typeof m !== 'object') return 0;
+  const raw = m.createTime ?? m.create_time ?? m.committedAt ?? m.timestamp ?? m.time ?? 0;
+  if (raw == null || raw === '') return 0;
+  if (typeof raw === 'string' && !/^\d+$/.test(raw.trim())) {
+    const t = Date.parse(raw);
+    return Number.isFinite(t) ? t : 0;
+  }
+  const n = Number(raw) || 0;
+  if (n <= 0) return 0;
+  if (n >= 1e11) return n;        // 毫秒（2001 年以后的 ms 都 > 1e11）
+  if (n >= 1e9) return n * 1000;  // 秒
+  return 0;                       // 认不出来就当没有，别拿它做判断
+}
 
 if (!KEY) { console.error('缺 WX_QUEUE_TOKEN（在 all48-live-sync/live-notify.env 里）'); process.exit(1); }
 
@@ -120,7 +149,9 @@ function wx(args, timeout = 30000) {
     p.on('close', (code) => {
       clearTimeout(t);
       if (code === 0) return resolve(out);
-      reject(new Error(`wx 退出码 ${code}：${(err || out).trim().slice(0, 200)}`));
+      /* 🔴 400 字：`messages send` 失败时会先打一行 `Submission receipt: …`
+         再打真正的错误，截 200 字常常只剩 receipt、看不到原因（2026-11-14 排查「回群失败」）。 */
+      reject(new Error(`wx 退出码 ${code}：${(err || out).trim().slice(0, 400)}`));
     });
   });
 }
@@ -161,7 +192,186 @@ function cmdOf(raw) {
   m = /^(?:lg|鸡腿)\s*([\u4e00-\u9fa5·][\s\S]*)$/i.exec(s);
   if (m) return { kind: 'lg', name: String(m[1] || '').trim().slice(0, 60) };
   if (/^(?:lg|鸡腿)$/i.test(s)) return { kind: 'lg', name: ' ' };
+  /* fy?… 查发言（2026-11-13 站长：「fy？用来查询个人 队伍的发言」）
+     · `fy` 可省分隔符：fy niii / fy?niii / fy：林舒晴
+     · 中文「发言」必须带问号 —— 「发言的人…」是在问话，不能当指令吃掉 */
+  m = /^fy\s*[?？:：,，.。、!！]?\s*([\s\S]*)$/i.exec(s);
+  if (m) return { kind: 'fy', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
+  m = /^发言\s*[?？:：,，.。、!！]\s*([\s\S]*)$/.exec(s);
+  if (m) return { kind: 'fy', name: String(m[1] || '').trim().slice(0, 60) || ' ' };
   return null;
+}
+
+/* ---------------- 云端指令前缀表（2026-11-12） ----------------
+   桥不再硬编码「哪些词算指令」：启动后每 10 分钟从 worker 拉一次 KV `wxcmd:spec`。
+   ⇒ 以后加指令：worker 里写解析 + KV 里加个前缀，**那台机器完全不用碰**。
+   🔴 拉不到就用内置默认（和以前的硬编码完全一致），行为不会退化。 */
+const SPEC_FILE = `${XDG}/state/wxspec.json`;
+const SPEC_DEFAULT = ['lg', '鸡腿', 'rb', 'mvp', '年度之星'];
+const SPEC_TTL = 3 * 60 * 1000;
+/* usage：前缀 → 用法文案，全部云端下发（2026-11-13「gy 查询指令」被当成人名去查名册）。
+   桥只负责「把云端那段贴出来」，文案一个字都不硬编码。 */
+let SPEC = { at: 0, prefixes: SPEC_DEFAULT.slice(), v: 0, usage: {} };
+const specUsage = (o) => {
+  const out = {};
+  if (o && typeof o === 'object' && !Array.isArray(o)) {
+    for (const k of Object.keys(o).slice(0, 12)) {
+      const v = String(o[k] || '');
+      if (k && v) out[String(k).slice(0, 20)] = v.slice(0, 600);
+    }
+  }
+  return out;
+};
+try {
+  const f = JSON.parse(readFileSync(SPEC_FILE, 'utf8'));
+  if (f && Array.isArray(f.prefixes) && f.prefixes.length) {
+    SPEC = { at: Number(f.at) || 0, prefixes: f.prefixes, v: Number(f.v) || 0, usage: specUsage(f.usage) };
+  }
+} catch { /* 首次没有缓存，用内置默认 */ }
+
+function specSave() {
+  try {
+    mkdirSync(dirname(SPEC_FILE), { recursive: true });
+    writeFileSync(SPEC_FILE, JSON.stringify({ at: SPEC.at, prefixes: SPEC.prefixes, v: SPEC.v, usage: SPEC.usage }));
+  } catch { /* 写不了也不影响运行 */ }
+}
+
+async function loadSpec(force) {
+  if (!force && Date.now() - SPEC.at < SPEC_TTL) return;
+  try {
+    const u = new URL(WORKER + '/api/wxcmd/spec');
+    u.searchParams.set('k', KEY);
+    const r = await fetch(u, { signal: AbortSignal.timeout(10000) });
+    const j = await r.json();
+    if (j && j.ok && Array.isArray(j.prefixes)) {
+      const list = j.prefixes.filter((x) => typeof x === 'string' && x.trim());
+      SPEC = { at: Date.now(), prefixes: list, v: Number(j.v) || 0, usage: specUsage(j.usage) };
+      specSave();
+      log(`指令表已更新（v${SPEC.v}）：${list.join(' / ') || '（空）'}`
+        + `；用法 ${Object.keys(SPEC.usage).length} 条`);
+    }
+  } catch (e) {
+    log('拉指令表失败（继续用本地表）：' + (e && e.message));
+  }
+}
+
+/** 原文是否以「云端登记的前缀」开头。命中返回 {kind:'raw', name:原文}。
+ *  这里只做粗筛——具体怎么查、文案长什么样，全在 worker / lv 站。
+ *  `lgtm` 这类不命中（紧跟的字符必须是分隔符或中文），和原来 cmdOf 的规则一致。 */
+function cloudCmd(raw) {
+  if (!SPEC.prefixes.length) return null;
+  const s = String(raw || '')
+    .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[\u2005\u00a0]/g, ' ')
+    .trim();
+  if (!s) return null;
+  const low = s.toLowerCase();
+  const hit = SPEC.prefixes.some((x) => {
+    const p = String(x || '').toLowerCase().trim();
+    if (!p || !low.startsWith(p)) return false;
+    const nx = low.charAt(p.length);
+    return nx === '' || /[\s?？:：,，.。、!！\u4e00-\u9fa5]/.test(nx);
+  });
+  return hit ? { kind: 'raw', name: s } : null;
+}
+
+/* ── 云端配置（2026-11-12 站长准则：「所有的配置都由云端下发，那台本地机器不做任何配置」）
+   ⇒ **云端是唯一真源**：群白名单、推送路由、冷却、AI 额度、机器人称呼、取件间隔，
+     全部由 KV `wxcfg:main` 整份下发，桥只负责照着跑。
+   本地唯一保留的东西是「机器环境」——wx 可执行文件、账号名、状态目录、云端地址与钥匙，
+   这些是连上云端的前提，本身不能云端化（钥匙不能从它要保护的门里取）。
+   🔴 可靠性：拉到就先落盘（`XDG/state/wxcfg.json`）。下次启动先读缓存再拉云端，
+     所以云端抖动、网络断一会儿都不会让机器人「失忆」变成无白名单裸奔。
+   🔴 字段缺失时用**内置默认**补齐，绝不用本地 env 的旧值 —— 否则又变回「本地也算一个源」。 */
+const CFG_FILE = `${XDG}/state/wxcfg.json`;
+const CFG_DEFAULTS = {
+  groups: [],                 // [] = 小号所在的所有群都认指令
+  requireMention: false,
+  cooldown: 1500,
+  aiDaily: 120,
+  botNames: ['boooot', '小48', '机器人', '48bot'],
+  pushGroups: [],
+  pushMap: {},
+  pushEvery: 6000,
+};
+
+/** 上次成功下发的配置（落盘）。启动先吃它，断网也不至于没配置。 */
+let cachedCfg = null;
+try {
+  const j = JSON.parse(readFileSync(CFG_FILE, 'utf8'));
+  if (j && typeof j === 'object') cachedCfg = j;
+} catch { cachedCfg = null; }
+
+/** 把云端给的那份 JSON 规整成**完整**配置（缺的补默认，脏的丢掉）。 */
+function cfgNormalize(c) {
+  const o = (c && typeof c === 'object') ? c : {};
+  const arr = (v, def) => (Array.isArray(v) ? v.map((x) => String(x == null ? '' : x).trim()).filter(Boolean) : def);
+  const num = (v, def, lo, hi) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.min(hi, Math.max(lo, n)) : def;
+  };
+  const map = {};
+  if (o.pushMap && typeof o.pushMap === 'object' && !Array.isArray(o.pushMap)) {
+    for (const [k, v] of Object.entries(o.pushMap)) {
+      const gk = String(k || '').trim();
+      if (!gk) continue;
+      map[gk] = Array.isArray(v) ? v.map((x) => String(x == null ? '' : x).trim()).filter(Boolean) : [];
+    }
+  }
+  return {
+    v: Number(o.v) || 1,
+    groups: arr(o.groups, CFG_DEFAULTS.groups),
+    requireMention: !!o.requireMention,
+    cooldown: num(o.cooldown, CFG_DEFAULTS.cooldown, 500, 60000),
+    aiDaily: num(o.aiDaily, CFG_DEFAULTS.aiDaily, 1, 5000),
+    botNames: arr(o.botNames, CFG_DEFAULTS.botNames).map((x) => x.toLowerCase()),
+    pushGroups: arr(o.pushGroups, CFG_DEFAULTS.pushGroups),
+    pushMap: map,
+    pushEvery: num(o.pushEvery, CFG_DEFAULTS.pushEvery, 3000, 600000),
+  };
+}
+
+/** 整份套用（不是「只覆盖写了的字段」——云端说什么就是什么） */
+function cfgApply(c) {
+  const x = cfgNormalize(c);
+  GROUPS = x.groups;
+  REQUIRE_MENTION = x.requireMention;
+  COOLDOWN = x.cooldown;
+  AI_DAILY = x.aiDaily;
+  BOT_NAMES = x.botNames;
+  PUSH_GROUPS = x.pushGroups;
+  PUSH_MAP = new Map(Object.entries(x.pushMap));
+  PUSH_EVERY = x.pushEvery;
+  return x;
+}
+
+let cfgSig = '';
+async function loadCfg(verbose = false) {
+  try {
+    const u = new URL(WORKER + '/api/wxcfg');
+    u.searchParams.set('k', KEY);
+    const r = await fetch(u, { signal: AbortSignal.timeout(10000) });
+    const d = await r.json().catch(() => null);
+    if (!d || !d.ok) { if (verbose) log('云端配置：读不到' + (cachedCfg ? '，沿用上次缓存' : '，用内置默认')); return false; }
+    const raw = d.cfg;
+    if (!raw || !Object.keys(raw).length) { if (verbose) log('云端配置：还是空的（未初始化），用缓存/默认'); return false; }
+    const x = cfgApply(raw);
+    try {
+      mkdirSync(dirname(CFG_FILE), { recursive: true });
+      writeFileSync(CFG_FILE, JSON.stringify(x));
+    } catch (e) { log('缓存云端配置失败：' + (e && e.message)); }
+    cachedCfg = x;
+    const sig = JSON.stringify(x);
+    if (sig === cfgSig) { if (verbose) log('云端配置：无变化'); return true; }
+    cfgSig = sig;
+    log(`配置已下发（云端 v${x.v}）：指令群=${GROUPS.join(',') || '全部'}　`
+      + `推送=${[...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + (ws.join('|') || '全部')).join('，') || PUSH_GROUPS.join(',') || '关'}　`
+      + `冷却=${COOLDOWN}ms　AI/天=${AI_DAILY}　取件=${Math.round(PUSH_EVERY / 1000)}s`);
+    return true;
+  } catch (e) {
+    if (verbose) log('云端配置拉取失败（' + String((e && e.message) || e).slice(0, 80) + '），沿用缓存/默认');
+    return false;
+  }
 }
 
 /* ---------------- 去重 & 限流 ---------------- */
@@ -175,6 +385,32 @@ function seen(id) {
   return false;
 }
 const lastSent = new Map();       // chatId -> ts
+/* 🔴 微信「服务端拒收」（service_rejected，2026-11-14 事故）：不是发得太快、不是内容问题，
+   而是**这个号被微信限流/风控**了 —— 换群、换内容、重试都没用，越试越重。
+   ⇒ 连 2 次就进冷却，时长按级翻倍（20 → 40 → 80 → 160 分钟，封顶 4 小时）；
+     冷却期间**完全不取件**，推送留在云端队列里（/api/wxb 取件才清空）；
+     冷却结束后的第一轮就是「探针」：能发出去就把等级清零，还被拒就再翻倍。
+   推送已收缩到 1 个群 / 60 秒（wxcfg:main），正常时一天也就几十次发送。 */
+let rejectStreak = 0;
+let pushPauseUntil = 0;
+let pauseLevel = 0;                        // 0 = 没在冷却；每升一级时长翻倍
+let lastSayRejected = false;               // 本次 say() 是不是「微信拒收」，供上层决定别补发
+const PAUSE_BASE = 20 * 60 * 1000;
+const PAUSE_CAP = 4 * 60 * 60 * 1000;
+function noteReject() {
+  rejectStreak++;
+  if (Date.now() < pushPauseUntil) return;     // 已在冷却，别重复加码
+  if (rejectStreak < 2) return;                // 一次可能是偶发（超时/网络），两次才算限流
+  pauseLevel = Math.min(pauseLevel + 1, 8);
+  const ms = Math.min(PAUSE_BASE * Math.pow(2, pauseLevel - 1), PAUSE_CAP);
+  pushPauseUntil = Date.now() + ms;
+  /* 冷却期间攒着的补发队列清掉：解封后一次性倒进群里既刷屏又过时，
+     而且「开播了/下播了」这种消息过了半小时本来就没有意义。 */
+  try { retryJobs.length = 0; } catch { }
+  log(`⚠️ 微信拒收（连续 ${rejectStreak} 次 service_rejected）⇒ 暂停推送 ${Math.round(ms / 60000)} 分钟`
+    + `（第 ${pauseLevel} 级）。这是小号被微信限流/风控，不是桥坏了；`
+    + '推送留在云端队列，解封后自然补上。');
+}
 
 /* ---------------- AI 聊天 ---------------- */
 
@@ -239,6 +475,40 @@ async function learnFrom(chat, q, a) {
   } catch (e) { log('学习失败：' + (e && e.message)); }
 }
 
+/* ── 本群专属「回复后缀」（2026-11-14）─────────────────────────────────
+   站长：「在群里跟机器人开玩笑，比如加个什么后缀，这个不要同步到别的群」。
+   ⇒ 存在 learn[chat].suffix，key 就是群 id：别的群读不到、也不会被带去，
+     不进全局 system prompt、不进云端配置，**天然按群隔离**。
+   用法（只认这几种说法，避免把「这个后缀不错」这种闲聊当成设置）：
+     后缀 ob 是笨蛋 / 回复后缀要加上 ob 是笨蛋 / 后缀? xxx
+     后缀            ← 看当前这个群有没有
+     后缀 清空        ← 只清这个群 */
+const SUF_HEAD = /^(?:(?:给我|你的|机器人的)?回复)?(?:后缀|尾巴)(?=$|[\s\u2005?？:：,，=]|(?:要|就)?(?:加上|加|改成|改为|设成|设为|设置成))/;
+function suffixSet(chat, raw) {
+  const s = String(raw || '').trim();
+  const m = SUF_HEAD.exec(s);
+  if (!m) return null;
+  const rest = s.slice(m[0].length).replace(/^[\s\u2005?？:：,，=]+/, '').trim();
+  const cur = String((learn[chat] && learn[chat].suffix) || '');
+  if (!rest) {
+    return cur
+      ? '这个群现在的后缀：「' + cur + '」\n（只在这个群生效；发「后缀 清空」可以去掉）'
+      : '这个群还没设后缀。发「后缀 ob 是笨蛋」这样设一条，只在这个群生效。';
+  }
+  if (/^(?:清空|清除|去掉|关掉|取消|删除|不要了|无|none)$/i.test(rest)) {
+    if (learn[chat]) { delete learn[chat].suffix; learnSave(); }
+    return '好，这个群的后缀去掉了（别的群本来就没受影响）。';
+  }
+  let txt = rest.replace(/^(?:要|就)?(?:加上|加|改成|改为|设置成|设成|设为|用|是|为)[\s\u2005]*/, '').trim();
+  txt = txt.replace(/^[「『"'（(]+/, '').replace(/[」』"'）)]+$/, '').trim();
+  if (!txt) return '后缀写空啦，再发一次试试。';
+  if (txt.length > 30) return '后缀太长（' + txt.length + ' 字），30 字以内吧。';
+  learn[chat] = { ...(learn[chat] || {}), suffix: txt, at: Date.now() };
+  learnSave();
+  log('设置本群后缀（' + chat + '）：' + txt);
+  return '好，以后在这个群说话末尾带「' + txt + '」。\n只对这个群生效，别的群我不会带上～';
+}
+
 /** 榜单摘要（5 分钟缓存）——让模型能答「谁第一 / 哪队领先」，不用它自己瞎猜 */
 async function boardCtx() {
   if (Date.now() - ctxCache.at < AI_CTX_TTL) return ctxCache.text;
@@ -273,6 +543,29 @@ async function memCtx(q) {
     const L = ['【成员资料·本站真实数据】',
       d.name + '｜' + (d.g || '') + ' ' + (d.tm || '') + (d.ot ? '（原队 ' + d.ot + '）' : '') + '｜' + (d.pd || '')];
     if (d.rb) L.push('红蓝：' + d.rb);
+    /* 她自己的鸡腿 / 公演（2026-11-13）：资料里以前只有红蓝，问「她鸡腿什么水平」
+       模型只能答「没有数据」。带上周环比，才能回答「最近涨了还是掉了」。 */
+    try {
+      const [l1, g1] = await Promise.all([
+        apiJson('/api/cmd?q=' + encodeURIComponent('lg?' + d.name), 12000),
+        apiJson('/api/cmd?q=' + encodeURIComponent('gy?' + d.name), 12000),
+      ]);
+      if (l1 && l1.ok && typeof l1.week === 'number') {
+        const wk = l1.week, pv = Number(l1.prev) || 0;
+        const wc = pv > 0
+          ? `，上周 ${fmtNum(pv)}（${wk >= pv ? '+' : ''}${(((wk - pv) / pv) * 100).toFixed(0)}%）`
+          : '';
+        L.push(`鸡腿（房间+直播，不含公演）：今日 ${fmtNum(l1.today)}，近7天 ${fmtNum(wk)}${wc}`);
+      }
+      if (g1 && g1.ok && g1.reply && !/没有公演/.test(String(g1.reply))) {
+        const ln = String(g1.reply).split('\n');
+        const head = ln[0] ? ln[0].replace(/^【|】$/g, '') : '';
+        L.push('公演鸡腿｜' + head.replace(/^公演[·•]\s*/, '')
+          + (ln[1] ? '｜' + ln[1].replace(/^公演鸡腿\s*/, '') : ''));
+      } else if (g1 && g1.ok) {
+        L.push('公演鸡腿：近 7 天没有她的公演记录');
+      }
+    } catch { /* 取不到就不写这一块 */ }
     /* 🔴 直播结论单独一屏、放最前面（2026-11-12 实测：只在资料中间写一句「此刻没在播」，
        模型照样答「最近在直播」；改成「结论 + 上次播的时间 + 禁用词表」后连续两次都答对）。 */
     L.push('【直播结论·可以直接说给群友】');
@@ -391,7 +684,7 @@ function isWhoAsk(s) {
 /** 机器人自己的名字（群昵称）。🔴 必须配：很多人是**手打**「@boooot」而不是点选 @，
  *  微信这时不给 atuserlist（`mentions.self=false`），只按协议判断会整条静默 ——
  *  2026-11-12 实测：站长手打 `@boooot 黄宣绮 最近3天的发言内容原话`，桥一声不响。 */
-const BOT_NAMES = String(process.env.WX_BOT_NAMES || 'boooot,小48,机器人,48bot')
+let BOT_NAMES = String(process.env.WX_BOT_NAMES || 'boooot,小48,机器人,48bot')
   .split(/[,\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
 
 /* 🔴 自然语言查询：「帮我查陈淑钰的鸡腿」「niii 现在多少鸡腿」
@@ -417,9 +710,15 @@ async function naturalCmd(q) {
      判据：有说话动词 + 有时间指代 + **没有泛指词**（谁/哪些/成员/名单/有人…）。
      泛指词在场就说明问的是一群人（「预备生今天发言的人有谁」「最近五分钟说话的成员」）。 */
   const sayVerb = /(说话|发言|冒泡|讲话|开麦|发消息|上过线)/.test(s);
-  const genericQ = /(谁|哪些|哪个|几个|多少人|多少位|名单|大家|有人|成员|都在|都谁)/.test(s);
+  /* 🔴 `的人` 也算泛指（2026-11-13 站长实测：「队伍 niii 最近发言的人」被当成单人查询，
+     把**整句话**当人名丢给 /api/say → 回「这个我没认出来是问谁」）。
+     「发言的人 / 说话的人 / 冒泡的人 / 都有谁」问的都是名单，不是某一个人。 */
+  const genericQ = /(谁|哪些|哪个|几个|多少人|多少位|名单|大家|有人|成员|都在|都谁|的人)/.test(s);
   const timeRef = /(今天|今日|当天|昨天|昨日|前天|最近|刚才|刚刚|\d{1,2}\s*[月\-\/.]\s*\d{1,2}|\d+\s*天)/.test(s);
-  if (sayVerb && !genericQ && timeRef && !dataQ) return { kind: 'say', name: s };
+  /* 句子里点了队/团名 ⇒ 一定是问队内名单，绝不能当「某个人今天说话了没」。
+     （「NIII 的黄宣绮今天说话了吗」会被多列几个人，这个偏差可以接受；
+       反过来把整句人名化则是直接答非所问。） */
+  if (sayVerb && !genericQ && timeRef && !dataQ && !team) return { kind: 'say', name: s };
   if (wq && !dataQ && WHO_VERB.test(s)) {
     return { kind: 'when', name: JSON.stringify({ team, dayOff: wq.dayOff, h: wq.h, end: wq.end, half: wq.half }) };
   }
@@ -442,14 +741,21 @@ async function naturalCmd(q) {
   if (!kind && /年度之星|mvp|星梦值/i.test(s)) kind = 'mvp';
   if (!kind) return null;
 
+  /* 「全团 / 全员 / 全体」—— `rb?全团` 云端直接出团汇总（2026-11-12 站长群里问「查全团的红蓝」，
+     原来这里认不出、落到 AI 回了句「哈喽～想聊啥？」）。lg 暂无全团维度，交给下面走空名给用法。 */
+  if (kind === 'rb' && /全团|全员|全体|所有团/.test(s)) return { kind: 'rb', name: '全团' };
+
   /* 「年度之星第一是谁 / 前 20」这种没有具体人名的，直接给总榜 */
   if (kind === 'mvp' && /第一|谁|排行|榜|前\s*\d+/.test(s)) {
     const tm = /前\s*(\d{1,3})/.exec(s);
     return { kind: 'mvp', name: 'top' + Math.min(50, Number(tm && tm[1]) || 10) };
   }
 
-  const tw = /(广州联合|川渝联合|预备生|IDFT)|(?:team\s*)?\b(niii|nii|sii|hii|snh|gnz|bej|cgt|ckg)\b/i.exec(s);
-  if (tw) return { kind, name: String(tw[1] || tw[2] || '').trim() };
+  /* 队/团名统一走 teamOf：它认「队伍 niii」「team g」「bej队」这些口语写法，
+     并且**一律转大写**（原来这里各自匹配一套小写正则，`niii 多少鸡腿` 会把小写原样
+     传给 lv，靠下游自己容错；统一口径后少一层隐患）。 */
+  const tw = teamOf(s);
+  if (tw) return { kind, name: tw };
 
   try {
     const u = new URL(WORKER + '/api/mem');
@@ -458,6 +764,10 @@ async function naturalCmd(q) {
     const d = await (await fetch(u, { signal: AbortSignal.timeout(12000) })).json();
     if (d && d.ok && d.name) return { kind, name: d.name };
   } catch { }
+  /* 认出了是「红蓝 / 鸡腿」，但里面没有具体对象时：
+     · 明确在问「怎么用」⇒ 回空名，让云端给**用法**（比丢给 AI 回「哈喽～想聊啥？」有用）
+     · 其它情况一律 null 交给 AI —— 免得「今天红蓝好卷」这种闲聊被当成查询刷屏 */
+  if (/指令|用法|怎么|如何|怎样|咋查|查什么/.test(s)) return { kind, name: '' };
   return null;
 }
 
@@ -513,6 +823,15 @@ const TEAM_ASK = new RegExp([
   '(预备生|idft|广州联合|川渝联合)',
 ].join('|'), 'i');
 function teamOf(s) {
+  const t = String(s || '');
+  /* 🔴 「队伍 niii」「队伍是 g」—— 群里最顺口的说法，原来完全不认（2026-11-13 实测
+     「队伍 niii 最近发言的人」被当成单人名去查）。单字母队名靠「队伍」这个前缀才敢认，
+     不会像裸字母那样误伤。 */
+  const u = /队伍\s*(?:是|为)?\s*([a-z]{1,4})(?![a-z])/i.exec(t);
+  if (u) {
+    const v = u[1].toUpperCase();
+    if (/^(SNH|GNZ|BEJ|CGT|CKG|NIII|NII|GII|SII|HII|CII|KII|XII|[GZXCKBE])$/.test(v)) return v;
+  }
   const m = TEAM_ASK.exec(String(s || ''));
   if (!m) return '';
   const v = m[1] || m[2] || m[3] || m[4] || m[5] || '';
@@ -734,7 +1053,9 @@ async function askAI(chat, q) {
      模型会把 A 的原话安到 B 头上（2026-11-12 实测：问陈淑钰，答成王语晨的话）。 */
   const hist = (aiHist.get(chat) || []).slice(-(mem ? 2 : 8));
   const messages = [
-    { role: 'system', content: [AI_SYS, learnCtx(chat), who, ctx, mem].filter(Boolean).join('\n\n') },
+    /* 🔴 云端下发的全部指令也塞进来：被问「你都会啥/有哪些指令」时，模型照抄即可，
+       云端新加了指令它自然就知道（不用再改代码里的 AI_SYS）。 */
+    { role: 'system', content: [AI_SYS, usageAll() ? '【你会这些指令】\n' + usageAll() : '', learnCtx(chat), who, ctx, mem].filter(Boolean).join('\n\n') },
     ...hist,
     { role: 'user', content: q },
   ];
@@ -775,46 +1096,647 @@ async function askAI(chat, q) {
   return out.slice(0, 1200);
 }
 
+/* ---------------- 工具决策：让模型听懂人话，但数据永远由桥去取 ----------------
+   站长 2026-11-13：「AI 它其实不是指令，是一个自然语言」。
+   做法：模型只输出**一行 JSON**（选哪个工具 + 参数），执行在本地、数据来自接口，
+   所以模型没有任何编数据的空间；它判断「不用查」时自己写一句 reply。
+   🔴 规则（naturalCmd）仍排在最前面：认得出的问法 0 次模型调用，只有认不出的才走到这里。
+     两边都留着不是冗余 —— 规则是毫秒级、免费、结果稳定，模型负责覆盖长尾说法。 */
+
+const TOOL_DOC = [
+  '【可用工具】只能选一个。参数必须是真实的名字/队名，拿不准就留空。',
+  'who   最近几分钟谁在说话      {"team":"NIII","min":30}   team 可省，min 默认 5',
+  'when  某天/某时段谁在说话     {"team":"G","day":"昨天","hour":11}   hour 省=整天',
+  'say   某成员说过什么原话      {"name":"林舒晴","days":3}   也可加 "day":"昨天"',
+  'lg    鸡腿（房间+直播）       {"target":"林舒晴"}   target 可为队名/团名/空',
+  'gy    公演鸡腿                {"target":"niii","range":"近7天"}',
+  'rb    红蓝分                  {"target":"niii"}   也可 "group"（全团）/"top64"',
+  'mvp   年度之星                {"target":"top20"}  或成员名',
+  'none  不需要查数据           必须同时给 reply',
+  'analyze  要解释原因/对比/趋势/评价（不是单纯查一个数）  {"focus":"niii 这周鸡腿为什么掉"}',
+].join('\n');
+
+const PLAN_RULES = [
+  '【怎么回】',
+  '1. 需要真实数据（谁在说话/某人说了什么/鸡腿/红蓝/公演/年度之星/排名）→ 只输出工具 JSON，不要自己写答案。',
+  '1b. 单纯要一个数/一个榜 → 用上面的具体工具（快、准）；要**解释原因、对比两队、看趋势、下判断** → 用 analyze。',
+  '2. 不需要数据（闲聊、玩梗、问规则、让你改口叫外号）→ {"tool":"none","reply":"你的回复"}'
+  + '（reply ≤80字，**必须写，不能空**）',
+  '3. 🔴 只能输出**一行 JSON**，必须以 {\"tool\" 开头；不要 ``` 围栏、不要解释、不要换行。',
+  '4. 🔴 参数一律放在 args 里，不要写 action/param/target 之类的变体。',
+  '5. 🔴 绝对不许把分数/名单/原话写进 JSON —— 那些由工具去查，你写了就是编。',
+  '例：{"tool":"who","args":{"team":"NIII","min":5}}',
+  '例：{"tool":"say","args":{"name":"林舒晴","days":3}}',
+  '例：{"tool":"none","reply":"叫小48，随时问我就好"}',
+].join('\n');
+
+/* 云端下发的「全部指令」说明。🔴 一处来源两处用：
+   ① 群里发 `?` / 「指令」直接贴出去；② 塞进 AI 的 system —— 否则模型被问
+   「你都会啥」只能靠 AI_SYS 里那几句写死的，云端新加的指令它根本不知道。 */
+function usageAll() {
+  return String(SPEC.usage._all || '').trim();
+}
+
+const planSys = () => AI_SYS + '\n\n'
+  + (usageAll() ? '【你现在会这些指令，被问到就照这个说】\n' + usageAll() + '\n\n' : '')
+  + TOOL_DOC + '\n\n' + PLAN_RULES;
+
+/* 🔴 模型输出的键名完全不受控（实测三种：args / param / 参数直接摆顶层；
+   tool 有时写成 action，或者干脆不写只给 {"team":"niii","min":5}）。
+   与其在提示词上较劲，不如在这里统一归一化 —— 提示词约束 + 结果兜底两手都要。 */
+const PLAN_ARGS_KEYS = ['team', 'min', 'day', 'hour', 'name', 'days', 'target', 'range'];
+function planNorm(p) {
+  if (!p || typeof p !== 'object') return null;
+  const pick = [p.args, p.param, p.params].find((x) => x && typeof x === 'object' && !Array.isArray(x));
+  const args = pick ? { ...pick } : {};
+  /* 顶层散落的参数搬进来（{"tool":"lg","target":"林舒晴"} 这种） */
+  for (const k of PLAN_ARGS_KEYS) if (args[k] === undefined && p[k] !== undefined) args[k] = p[k];
+  let tool = String(p.tool || p.name_tool || p.action || p.fn || '').toLowerCase();
+  /* 漏了 tool 键时只推测最稳的两种，其余当没用（猜错工具比不回答更糟） */
+  if (!tool) {
+    if (args.team || args.min) tool = 'who';
+    else if (args.name) tool = 'say';
+  }
+  return { tool, args };
+}
+
+/** 从模型输出里剥出那个 JSON 对象（模型爱带 ```json 围栏、前后废话，qwen 还会先念一段思考）。
+ *  🔴 不能用非贪婪正则：`{"tool":"who","args":{"team":"NIII"}}` 里有嵌套，必须配平括号。 */
+function planJson(t) {
+  const s = String(t || '').replace(/```[a-zA-Z]*\s*/g, '');
+  const found = [];
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '{') continue;
+    let d = 0;
+    for (let j = i; j < s.length; j++) {
+      if (s[j] === '{') d++;
+      else if (s[j] === '}') {
+        d--;
+        if (!d) {
+          try {
+            const o = JSON.parse(s.slice(i, j + 1));
+            if (o && typeof o === 'object' && !Array.isArray(o)) found.push(o);
+          } catch { /* 这一段不是合法 JSON，往后找 */ }
+          break;
+        }
+      }
+    }
+  }
+  /* 优先带 tool 的那个；模型漏了 tool 只给参数时，取第一个（planNorm 兜底推断） */
+  return found.find((o) => 'tool' in o) || found[0] || null;
+}
+
+/** 让模型做一次「调哪个工具」的决策。失败返回 null（调用方降级到普通聊天）。 */
+async function aiPlan(q, chat) {
+  if (!AI_ON) return null;
+  const ymd = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+  const qk = chat + ':' + ymd;
+  if ((aiQuota.get(qk) || 0) >= AI_DAILY) return null;
+
+  let out = '';
+  /* 🔴 qwen3 默认先写一大段「思考」，把 max_tokens 吃光后 content 就是空的
+     （实测「今晚公演鸡腿谁最高」直接 blank，10 秒白等）。`/no_think` 是 Qwen3 官方的关思考开关，
+     实测耗时从 3.8s 降到 0.5s，且 JSON 更规矩。 */
+  const ask = q + '\n/no_think';
+  try {
+    if (AI_VIA_WORKER) {
+      const res = await fetch(WORKER + '/api/ai?k=' + encodeURIComponent(KEY), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        /* 只带 system + 这一句：决策不需要历史（历史里有别人的名字，容易被带跑） */
+        body: JSON.stringify({ q: ask, sys: planSys(), hist: [], mt: 400 }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const d = await res.json().catch(() => null);
+      if (!d || !d.ok) return null;
+      out = String(d.reply || '');
+    } else {
+      const res = await fetch(AI_BASE + '/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + AI_KEY },
+        body: JSON.stringify({
+          model: AI_MODEL, temperature: 0.2, max_tokens: 400,
+          messages: [{ role: 'system', content: planSys() }, { role: 'user', content: ask }],
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!res.ok) return null;
+      const d = await res.json();
+      out = String((((d.choices || [])[0] || {}).message || {}).content || '');
+    }
+  } catch (e) {
+    log('plan 失败：' + String((e && e.message) || e).slice(0, 80));
+    return null;
+  }
+  if (!out.trim()) return null;
+  aiQuota.set(qk, (aiQuota.get(qk) || 0) + 1);
+  const raw = planJson(out);
+  if (!raw) { log('plan 不是 JSON：' + out.replace(/\s+/g, ' ').slice(0, 80)); return null; }
+  const p = planNorm(raw) || raw;
+  /* 🔴 参数必须**来自用户这句话**。实测模型会顺着语气脑补：问「今晚公演鸡腿谁最高」
+     它给 team=niii（全团的问题被缩成 NIII 队，数字直接错）。宁可清空参数走全团，
+     也不能让它凭空指定对象。 */
+  return planGuard(p, q);
+}
+
+/** 把模型给的参数和原句对一遍，原句里没有的一律丢掉（纯函数，方便回归） */
+function planGuard(p, q) {
+  if (!p || !p.args) return p;
+  const lowq = String(q || '').toLowerCase();
+  for (const k of ['team', 'name', 'target']) {
+    const v = String(p.args[k] || '').trim();
+    if (!v) continue;
+    const lit = /^(全团|全员|全体|全站|全团榜|group|top\d+)$/i.test(v);
+    if (!lit && !lowq.includes(v.toLowerCase())) {
+      log(`plan 参数不在原句里，丢弃：${k}=${v}（原句：${String(q).slice(0, 24)}）`);
+      delete p.args[k];
+    }
+  }
+  return p;
+}
+
+/* 队名白名单：模型可能吐「NIII队」「niii 」这种，清洗后再决定用不用 */
+const TEAM_OK = /^(SNH|GNZ|BEJ|CGT|CKG|NIII|NII|GII|SII|HII|CII|KII|XII|G|Z|X|C|K|B|E|预备生|IDFT|广州联合|川渝联合)$/;
+
+/** 执行模型选的工具，返回可直接发群的文案（空字符串 = 没查到/不能执行） */
+async function runTool(p) {
+  const t = String((p && p.tool) || '').toLowerCase();
+  const a = (p && p.args && typeof p.args === 'object') ? p.args : {};
+  let team = String(a.team || '').toUpperCase().replace(/队$/, '').trim().slice(0, 12);
+  if (team && !TEAM_OK.test(team)) team = '';
+  const min = Math.min(720, Math.max(1, Number(a.min) || 5));
+  const dayStr = String(a.day || '');
+  const dayOff = /前天/.test(dayStr) ? -2 : (/昨天|昨日/.test(dayStr) ? -1 : 0);
+
+  if (t === 'who') return whoReply(min, team);
+
+  if (t === 'when') {
+    const h = Number(a.hour);
+    if (isFinite(h) && h >= 0 && h <= 23) return whenReply({ team, dayOff, h, end: h + 1, half: false });
+    return whenReply({ team, dayOff, wholeDay: true });
+  }
+
+  if (t === 'say') {
+    const name = String(a.name || '').trim().slice(0, 30);
+    if (!name) return '';
+    const days = Math.min(7, Math.max(1, Number(a.days) || 3));
+    /* 拼成 sayRaw 认得的说法：它靠 RAW_ASK（发言/原话）当闸门，靠 bjDayRange 认「昨天」 */
+    const q = name + ' ' + (dayStr ? dayStr.slice(0, 8) + ' ' : '最近' + days + '天 ') + '的发言原话';
+    const txt = await sayRaw(q);
+    return txt || '';
+  }
+
+  if (t === 'lg' || t === 'rb' || t === 'mvp' || t === 'gy') {
+    const target = String(a.target || a.name || '').trim().slice(0, 40);
+    /* 「今晚/昨晚」这种口语 lv 那边不认，先归成它能解析的写法 */
+    const rg = String(a.range || '').replace(/今晚|今早/g, '今天').replace(/昨晚|昨早/g, '昨天').trim();
+    let q;
+    if (t === 'gy') q = 'gy?' + target + (rg ? ' ' + rg.slice(0, 20) : '');
+    else q = t + '?' + (target || ' ');
+    const u = new URL(WORKER + '/api/cmd');
+    u.searchParams.set('k', KEY);
+    u.searchParams.set('q', q);
+    const r = await (await fetch(u, { signal: AbortSignal.timeout(20000) })).json().catch(() => null);
+    return (r && r.ok && r.reply) ? String(r.reply).slice(0, 1800) : '';
+  }
+  return '';
+}
+
+/* ---------------- 「这条指令怎么用」 ----------------
+   2026-11-13 实测：站长发 `gy 查询指令`，被当成 `gy?查询指令` → 去名册里找「查询指令」这个人
+   → 回「名册里没找到「查询指令」」。任何前缀后面跟「用法/指令/怎么用/help」都应该回说明。
+   🔴 文案由云端下发（KV `wxcmd:spec` 的 usage 字段），桥里**不留**任何一条指令的说明文字，
+      否则改文案又要发版、又出现「本地云端两份」。没配就只说「发『指令』看全部」。 */
+function usageFor(c, plain) {
+  /* 「有哪些指令 / 全部命令 / gy 用法 / 怎么用」都要认 —— 但必须**整句等于**这些说法，
+     「这个用法不错」这种闲聊不能触发（2026-11-13 群里实测过一堆口径）。 */
+  const HELP = new RegExp([
+    '^(?:查询|查看|看一下)?(?:指令|用法|说明|帮助|怎么用|怎么查|怎么看|help|menu)$',
+    '^(?:有|都有|能|会)?(?:哪些|什么|几个)?(?:指令|命令|功能|用法)(?:吗|呢|呀)?$',
+    '^(?:全部|所有|全部指令|所有指令|全部命令|全都能查)$',
+    '^[?？]$',
+  ].join('|'), 'i');
+  let key = '';
+  let rest = '';
+  if (c) {
+    if (c.kind === 'raw') {
+      /* raw 的 name 是整句，先认出命中哪个前缀，剩下的才算「问的是用法」 */
+      const s = String(c.name || '');
+      const p = SPEC.prefixes.map((x) => String(x))
+        .sort((a, b) => b.length - a.length)
+        .find((x) => x && s.toLowerCase().startsWith(x.toLowerCase()));
+      if (p) { key = p.toLowerCase(); rest = s.slice(p.length); }
+      else rest = s;
+    } else {
+      key = String(c.kind || '').toLowerCase();
+      rest = String(c.name || '');
+    }
+    rest = rest.replace(/^[\s?？:：,，.。、!！]+/, '').trim();
+  } else {
+    rest = String(plain || '').trim();
+  }
+  if (!HELP.test(rest)) {
+    /* 单独一个「?」= 看全部指令（站长 2026-11-13）。`gy?` 这种带前缀的不算 —— 那是查全团。 */
+    if (rest === '?' || rest === '？') {
+      if (c && c.kind === 'raw') return '';
+      return SPEC.usage._all || '这条我还不知道咋用～直接发「指令」看我能查什么';
+    }
+    return '';
+  }
+  return SPEC.usage[key] || SPEC.usage._all || '这条我还不知道咋用～直接发「指令」看我能查什么';
+}
+
+/* ---------------- 分析层：把全站真实数据喂给模型，让它自己判断 ----------------
+   站长 2026-11-13：「我需要 AI 是智能的 —— 把补档站所有的内容给到它，跟它聊的时候它能
+   识别我的意图、给一定的分析。虽然消耗 token，但这个有价值。能用指令查到的时候就不要
+   token，查不到的时候它自己去分析。」
+   于是三层分工：
+     ① 显式指令 / 规则认得出 → 直接查（0 次模型调用，毫秒级）
+     ② 要判断、解释、对比、趋势、预测 → 这里（喂**真实数据快照**，1 次模型调用）
+     ③ 纯闲聊 → askAI
+   🔴 模型只能看事实包，事实包里没有的数字它一个字都不许说。 */
+
+/* 什么算「要分析」：解释原因、比较、趋势、评价、预测。🔴 别把「多少/谁/第几」这类
+   纯查询的词放进来 —— 那些走规则更快更准，白花 token。 */
+const ANALYZE_Q = new RegExp([
+  '为什么|为啥|咋回事|怎么回事|怎么会',
+  '分析|对比|比较|趋势|走势|变化|起伏',
+  '进步|退步|下滑|掉了|跌了|涨了|拉开|追上|反超',
+  '表现|评价|点评|总结|盘点|格局|实力|潜力|竞争力',
+  '谁更|哪队|哪个队|哪个团|会不会|预测|值得|建议|该怎么|怎么看|怎么样|如何',
+].join('|'));
+
+const FACTS_TTL = 4 * 60 * 1000;
+let factsCache = { at: 0, text: '' };
+
+/** 带 k 的 GET（失败一律 null，缺块就少一块，绝不因为一块挂了整个分析失败） */
+async function apiJson(path, ms = 9000) {
+  try {
+    const u = new URL(WORKER + path);
+    u.searchParams.set('k', KEY);
+    const r = await fetch(u, { signal: AbortSignal.timeout(ms) });
+    return await r.json().catch(() => null);
+  } catch { return null; }
+}
+
+/** 全站快照（与问题无关的公共部分，缓存 4 分钟 —— 一次分析要拉 5 个接口，
+ *  群里连问三句不该重复拉）。*/
+async function factsBase() {
+  if (factsCache.text && Date.now() - factsCache.at < FACTS_TTL) return factsCache.text;
+  const [gift, lg, gy, mvp, who, live] = await Promise.all([
+    apiJson('/api/gift?limit=15', 15000),      // 红蓝累计（团/队/成员）
+    /* 全团鸡腿 + **逐日序列 + 上周**（2026-11-13 新增）：没有序列就只能说「没数据」，
+       「为什么这周掉」「哪个队涨得最快」这类问题全靠它。 */
+    apiJson('/api/cmd?q=' + encodeURIComponent('lg?'), 15000),
+    apiJson('/api/cmd?q=' + encodeURIComponent('gy?'), 15000),   // 公演鸡腿近7天
+    apiJson('/api/cmd?q=' + encodeURIComponent('mvp?top20'), 9000), // 年度之星
+    apiJson('/api/who?min=60&n=12', 9000),     // 近1小时房间活跃
+    apiJson('/api/live', 9000),                // 此刻在播
+  ]);
+  const L = ['【本站真实数据·快照 ' + bjHM(Date.now()) + '】'];
+
+  if (gift && Array.isArray(gift.rank) && gift.rank.length) {
+    L.push(`■ 红蓝歌会（${gift.from}~${gift.to}，${gift.daysCount || '?'} 天，累计 ${fmtNum(gift.total)} 分，${gift.records || '?'} 笔礼物）`);
+    const gs = (gift.groups || []).filter((x) => x.score > 0).sort((a, b) => b.score - a.score)
+      .map((x) => `${x.key} ${fmtNum(x.score)}（${x.members}人）`).join(' · ');
+    if (gs) L.push('　团：' + gs);
+    /* 🔴 各团的「预备生」是不同的人，光写「预备生」会出现四行同名 ⇒ 带上团名 */
+    const ts = (gift.teams || []).filter((x) => x.score > 0).sort((a, b) => b.score - a.score)
+      .slice(0, 10).map((x) => `${String(x.g || '').replace(/48$/, '')}`
+        + `·${String(x.tm || '').replace(/^TEAM\s*/i, '')} ${fmtNum(x.score)}`).join(' · ');
+    if (ts) L.push('　队：' + ts);
+    const rk = gift.rank.slice(0, 15).map((x, i) => `${i + 1}.${x.name} ${fmtNum(x.score)}`
+      + (x.team ? '(' + String(x.team).replace(/^TEAM\s*/i, '') + ')' : '')).join(' · ');
+    L.push('　成员前15：' + rk);
+  }
+
+  /* 全团鸡腿（房间+直播）：今日 / 近7天 / 上周 + 逐日 + 队 + 成员前 15。
+     🔴 只有机读字段（series/teams/top）才可信，别去解析 reply 的排版。 */
+  if (lg && lg.ok && Array.isArray(lg.series)) {
+    const wk = Number(lg.week) || 0, pv = Number(lg.prev) || 0;
+    const pct = pv > 0 ? ((wk - pv) / pv) * 100 : 0;
+    const wow = pv > 0 ? `，上周 ${fmtNum(pv)}（环比 ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%）` : '';
+    L.push(`■ 全站鸡腿（房间+直播，不含公演）：今日 ${fmtNum(lg.today)}，近7天 ${fmtNum(wk)}${wow}`);
+    const day = (lg.series || []).slice(-7)
+      .map((x) => `${String(x.d).slice(4, 6)}-${String(x.d).slice(6, 8)} ${fmtNum(x.v)}`).join(' · ');
+    if (day) L.push('　全站逐日 ' + day);
+    const ts = (lg.teams || []).filter((x) => x.w > 0).slice(0, 10)
+      .map((x) => {
+        const w = Number(x.w) || 0, p = Number(x.prev) || 0;
+        const pc = p > 0 ? ` ${((w - p) / p) * 100 >= 0 ? '+' : ''}${(((w - p) / p) * 100).toFixed(0)}%` : '';
+        return `${String(x.g || '').replace(/48$/, '')}·${String(x.k || '').replace(/^TEAM\s*/i, '')}`
+          + ` ${fmtNum(w)}${pc}`;
+      })
+      .join(' · ');
+    if (ts) L.push('　队（近7天，括号内为环比）：' + ts);
+    const tp = (lg.top || []).slice(0, 15)
+      .map((x, i) => `${i + 1}.${x.n} ${fmtNum(x.w)}`)
+      .join(' · ');
+    if (tp) L.push('　成员前15（近7天）：' + tp);
+  }
+
+  if (gy && gy.ok && gy.reply) {
+    const ln = String(gy.reply).split('\n').filter((x) => x.trim());
+    if (ln[0]) L.push('■ 公演鸡腿｜' + ln[0].replace(/^【([^】]*)】\s*/, '$1｜').replace(/^公演[·•]\s*/, ''));
+    if (ln[1] && /^共/.test(ln[1])) L.push('　' + ln[1]);
+    const rows = ln.filter((x) => /^\d+\./.test(x)).slice(0, 12).map((x) => x.replace(/^(\d+)\.\s*/, '$1.'));
+    if (rows.length) L.push('　' + rows.join(' · '));
+  }
+
+  if (mvp && mvp.ok && mvp.reply) {
+    const ln = String(mvp.reply).split('\n').filter((x) => x.trim());
+    if (ln[0]) L.push('■ 年度之星｜' + ln[0].replace(/^【([^】]*)】\s*/, '$1｜'));
+    const rows = ln.filter((x) => /^\d+\./.test(x)).slice(0, 10).map((x) => x.replace(/^(\d+)\.\s*/, '$1.'));
+    if (rows.length) L.push('　' + rows.join(' · '));
+  }
+
+  if (live && Array.isArray(live.list) && live.list.length) {
+    const s = live.list.slice(0, 6).map((x) => `${String(x.nickname || '').replace(/^[A-Z]{3,4}48-/, '')}`
+      + `「${String(x.title || '').slice(0, 18)}」${fmtNum(x.onlineUserNum)}人在看`);
+    L.push(`■ 此刻在播（${live.list.length} 间）：` + s.join(' · '));
+  } else if (live) {
+    L.push('■ 此刻没有成员在播');
+  }
+
+  if (who && who.ok && Array.isArray(who.list) && who.list.length) {
+    /* 🔴 接口是按时间倒序给的，问「最活跃」必须自己按条数排 */
+    const s = who.list.slice().sort((a, b) => (b.c || 0) - (a.c || 0)).slice(0, 8)
+      .map((x) => `${x.n}(${String(x.tm || x.g || '').replace(/^TEAM\s*/i, '')})${x.c}条`);
+    L.push(`■ 近 60 分钟口袋房间：${who.total} 人发言 ${who.msgN || 0} 条，最活跃 ` + s.join(' · '));
+    const q = who.list.find((x) => x.x);
+    if (q) L.push(`　样本原话：${q.n}「${String(q.x).slice(0, 40)}」`);
+  }
+
+  const text = L.join('\n');
+  if (L.length > 1) factsCache = { at: Date.now(), text };
+  return text;
+}
+
+/** 某一支队自己的鸡腿曲线（今日 / 近7天 / 上周 / 逐日 / 队内前5）。
+ *  🔴 全团块给的是**全站**逐日，拿它去解释某支队为什么会得出错误结论
+ *  （实测模型把全站的 11-11 峰值当成 NIII 的，说「NIII 从 956 万掉到 470 万」）。 */
+async function teamFacts(team) {
+  const j = await apiJson('/api/cmd?q=' + encodeURIComponent('lg?' + team), 15000);
+  if (!j || !j.ok || !Array.isArray(j.series)) return '';
+  const wk = Number(j.week) || 0, pv = Number(j.prev) || 0;
+  const pct = pv > 0 ? ((wk - pv) / pv) * 100 : 0;
+  const wow = pv > 0 ? `，上周 ${fmtNum(pv)}（环比 ${pct >= 0 ? '+' : ''}${pct.toFixed(1)}%）` : '';
+  const L = [`■ ${j.team || team} 鸡腿（房间+直播）：今日 ${fmtNum(j.today)}，近7天 ${fmtNum(wk)}${wow}`];
+  const day = (j.series || []).slice(-7)
+    .map((x) => `${String(x.d).slice(4, 6)}-${String(x.d).slice(6, 8)} ${fmtNum(x.v)}`).join(' · ');
+  if (day) L.push('　逐日 ' + day);
+  const tp = (j.top || []).slice(0, 5).map((x, i) => `${i + 1}.${x.n} ${fmtNum(x.w)}`).join(' · ');
+  if (tp) L.push('　队内前5（近7天）：' + tp);
+  return L.join('\n');
+}
+
+/** 事实包 = 全站快照 + 点名成员的资料 + 点名队伍的曲线 + 规则已查到的那条数据 */
+async function factsPack(q, extra) {
+  let team = '';
+  try { team = q ? teamOf(q) : ''; } catch { team = ''; }
+  const [base, mem, tm] = await Promise.all([
+    factsBase().catch(() => ''),
+    q ? memCtx(q).catch(() => '') : Promise.resolve(''),
+    team ? teamFacts(team).catch(() => '') : Promise.resolve(''),
+  ]);
+  return [base, mem, tm, extra].filter(Boolean).join('\n\n');
+}
+
+const ANALYZE_SYS = [
+  '你是「弦月回响·红蓝歌会」粉丝群里的助手小48，现在在帮群友**看数据**。',
+  '下面会给你一份本站真实数据快照。请基于它回答，像熟悉48的老粉那样分析，不要像报表。',
+  '怎么写：',
+  '1. 第一句先给结论（谁/哪队/为什么），后面最多 3 条依据，每条带具体数字。',
+  '2. 总长 ≤220 字，最多 7 行；要分点就用「·」，不要 markdown 标题、表格、加粗。',
+  '3. 🔴 只能用快照里出现过的名字和数字。快照里没有的，就说「这个数据我这边没有」，绝不编。',
+  '4. 🔴 不要把快照原样抄一遍 —— 群友要的是判断，不是又看一次榜。',
+  '5. 🔴 三套数据不能混：红蓝是「红蓝分」、公演是「公演鸡腿」、房间/直播是「鸡腿」；'
+  + '没给到的那套就说没拿到，别拿另一套顶。',
+  '6. 🔴 分块看口径：「鸡腿」那块有 **7 天逐日 + 上周合计**，可以判断涨跌、找拐点、比哪个队最快；'
+  + '「红蓝」是 10-24 起累计、「公演」是近 7 天合计，这两块**没有逐日**，只能比大小、不能判趋势。',
+  '7. 🔴 被问「为什么掉」：先用逐日指出哪一天掉得最狠、掉了多少，再只根据快照里真有的东西'
+  + '（谁在播、谁在说话、有没有公演）给可能解释，最后一句说明「因果我这看不到」。'
+  + '不许把巧合说成原因。🔴 也先看清到底是不是在掉：环比是正数就是涨了，别顺着问句认下来。',
+  '8. 🔴 报数前后自己核一遍：A 比 B 大就不能写「低于」。全站数字不能当成某支队的数字用。',
+  '9. 🔴 不要罗列「未提及/没有数据/未见」这种空话，一句话说清能说什么就行。',
+  '10. 快照里的发言是过去时，不要写成「正在说」。',
+].join('\n');
+
+/** 让模型做一次分析。失败返回空串（调用方降级到普通聊天）。 */
+async function askAnalyze(chat, q, facts) {
+  if (!AI_ON) return '';
+  const ymd = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
+  const qk = chat + ':' + ymd;
+  const used = aiQuota.get(qk) || 0;
+  if (used >= AI_DAILY) return '今天这个群的 AI 次数用完了，明天再来吧。';
+  const sys = ANALYZE_SYS + '\n\n' + (usageAll() ? '【你会这些指令】\n' + usageAll() + '\n\n' : '') + facts;
+  try {
+    if (AI_VIA_WORKER) {
+      const res = await fetch(WORKER + '/api/ai?k=' + encodeURIComponent(KEY), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ q, sys, hist: [], mt: 700 }),
+        signal: AbortSignal.timeout(45000),
+      });
+      const d = await res.json().catch(() => null);
+      if (!d || !d.ok || !d.reply) return '';
+      aiQuota.set(qk, used + 1);
+      /* 分析带上下文：下一句「那她这周呢」要接得上 */
+      aiHist.set(chat, [...(aiHist.get(chat) || []), { role: 'user', content: q },
+        { role: 'assistant', content: String(d.reply) }].slice(-8));
+      return String(d.reply).slice(0, 1200);
+    }
+    const res = await fetch(AI_BASE + '/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + AI_KEY },
+      body: JSON.stringify({
+        model: AI_MODEL, temperature: 0.4, max_tokens: 700,
+        messages: [{ role: 'system', content: sys }, { role: 'user', content: q }],
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+    if (!res.ok) return '';
+    const d = await res.json();
+    const out = String((((d.choices || [])[0] || {}).message || {}).content || '').trim();
+    if (!out) return '';
+    aiQuota.set(qk, used + 1);
+    aiHist.set(chat, [...(aiHist.get(chat) || []), { role: 'user', content: q },
+      { role: 'assistant', content: out }].slice(-8));
+    return out.slice(0, 1200);
+  } catch (e) {
+    log('分析失败：' + String((e && e.message) || e).slice(0, 80));
+    return '';
+  }
+}
+
 /* ---------------- 处理一条 ---------------- */
 
+const oddDir = new Set();
 async function handle(ev) {
   const d = ev.data || {};
-  if (d.direction !== 'incoming') return;
+  if (d.direction !== 'incoming') {
+    /* 字段名/取值和预期不一致时，以前是静默 return —— 「收到事件却全丢」就查不出来 */
+    const k = String(d.direction);
+    if (!oddDir.has(k)) { oddDir.add(k); log('忽略方向：' + (k === 'undefined' ? '（事件里没有 direction）' : k)); }
+    return;
+  }
   const chat = String(d.threadId || '');
   if (!chat.endsWith('@chatroom')) return;                    // 只做群，私聊不接（免得小号私聊被刷）
   if (GROUPS.length && !GROUPS.includes(chat)) return;
   if (seen(String(d.messageId))) return;
 
-  const j = jsonOf(await wx(['--account', ACCOUNT, '--json', 'messages', 'get', String(d.messageId)]));
-  const m = (j && (j.message || j)) || null;
-  if (!m) return;
+  /* 每条都留一行（很短）：机器人「活着但不说话」时，这一行能立刻分辨是
+     「没收到事件」还是「收到了没认出来」——过去全靠猜，浪费了一整晚。 */
+  log(`收 ${chat.slice(0, 8)} ${String(d.senderName || d.fromName || '').slice(0, 10)}: ${String(d.text || d.body || '').replace(/\s+/g, ' ').slice(0, 30)}`);
+
+  /* 🔴 `messages get` 会偶发超时（2026-11-12 22:49 实测「处理异常：wx 超时」，
+     那条指令就这么静默丢了）。重试一次；还失败就用事件自带字段兜底 —— 事件里
+     一般就有 body/type，缺的只是 mentions，宁可漏判 @ 也别整条吞掉。 */
+  let m = null;
+  for (let i = 1; i <= 2 && !m; i++) {
+    try {
+      const j = jsonOf(await wx(['--account', ACCOUNT, '--json', 'messages', 'get', String(d.messageId)], 20000));
+      m = (j && (j.message || j)) || null;
+    } catch (e) {
+      log(`messages get 失败（${i}/2）：${String((e && e.message) || e).slice(0, 100)}`);
+      if (i < 2) await sleep(800);
+    }
+  }
+  if (!m) {
+    const fb = String(d.text || d.body || '').trim();
+    if (!fb) { log('消息取不到内容，跳过：' + String(d.messageId || '').slice(-12)); return; }
+    m = { type: d.type === undefined ? 1 : d.type, body: fb, mentions: d.mentions || {}, createTime: d.createTime };
+    log('用事件自带内容兜底解析：' + fb.slice(0, 30));
+  }
+  /* 🔴 历史消息一律不回复（新机器首启 / 游标丢失时会重放） */
+  if (Date.now() < SILENT_UNTIL) return;
+  const mt = msgTimeMs(m);
+  if (mt && mt < START_AT - 120000) return;
   if (Number(m.type) !== 1) return;                           // 只要纯文本，图片/引用/文件一概略过
 
   const men = m.mentions || {};
   if (REQUIRE_MENTION && !men.self && !men.all) return;
+
+  /* 单独一个「?」= 看全部指令。🔴 必须 @ 我 —— 群里随便谁打个问号不该刷一屏。 */
+  const body0 = String(m.body || '');
+  const plain0 = (body0.replace(/^@[^\s\u2005]+[\s\u2005]+/, '') || body0).trim();
+  if (/^[?？]$/.test(plain0) && !(men.self || men.all)) return;
 
   const body = String(m.body || '');
   /* 手打 `@boooot lg?bej` 也要认：微信没给 atuserlist 时正文里就带着 @名字，剥掉再解析一次 */
   const stripped = body.replace(/^@[^\s\u2005]+[\s\u2005]+/, '');
   const plain = stripped || body;
   let c = cmdOf(body) || (stripped !== body ? cmdOf(stripped) : null);
+  /* 云端登记的新指令前缀（KV wxcmd:spec）——命中就把原文整句转给 worker 解析 */
+  if (!c) c = cloudCmd(plain);
+
+  /* 🔴 本群专属后缀：必须排在 AI / 自然语言之前 —— 否则「回复后缀要加上 X」
+     会被当成闲聊，模型只回一句玩笑话、什么都没存（2026-11-14 站长就是撞在这个上）。 */
+  if (!c) {
+    const sr = suffixSet(chat, plain0);
+    if (sr) { await say(chat, sr, '[后缀]'); return; }
+  }
+
+  /* ② 需要判断/解释/对比/趋势 → 分析层（喂真实数据快照，1 次模型调用）
+     🔴 排在规则之前：`NIII这周鸡腿怎么掉这么多` 这种句子规则只会回一个榜，
+        群友要的是「为什么」。真正的纯查询（多少/谁/第几）不含这些词，仍旧走规则。
+     显式指令（lg?/gy?/fy? 等）已经在前面命中，不会被这里抢走。 */
+  if (!c && ANALYZE_Q.test(plain)) {
+    try {
+      /* 先把规则认得出的那条数据也查出来一起喂（问「NIII 为什么掉了」，没有 NIII 的榜就没法答） */
+      let extra = '';
+      try {
+        const r0 = await naturalCmd(plain);
+        if (r0 && /^(lg|gy|rb|mvp)$/.test(String(r0.kind))) {
+          const u0 = new URL(WORKER + '/api/cmd');
+          u0.searchParams.set('k', KEY);
+          u0.searchParams.set('q', r0.kind + '?' + (r0.name || ' '));
+          const d0 = await (await fetch(u0, { signal: AbortSignal.timeout(15000) })).json().catch(() => null);
+          if (d0 && d0.ok && d0.reply) extra = '【规则查到的原始数据】\n' + String(d0.reply).slice(0, 900);
+        }
+      } catch { /* 查不到就不带，分析仍然可用 */ }
+      const facts = await factsPack(plain, extra);
+      const txt = await askAnalyze(chat, plain, facts);
+      if (txt) { await say(chat, txt, '[分析] ' + plain.slice(0, 16)); return; }
+    } catch (e) { log('分析没成：' + ((e && e.message) || e).toString().slice(0, 80)); }
+    /* 分析失败就继续往下走常规路径，不能让一条问句没回音 */
+  }
+
   /* 自然语言查询（「帮我查陈淑钰的鸡腿」）—— 必须先于 AI，否则模型拿红蓝分冒充鸡腿 */
   if (!c) { try { c = await naturalCmd(plain); } catch { c = null; } }
+
+  /* 「XX 查询指令 / 用法 / 怎么用」→ 贴云端下发的说明（这条要排在 fy 展开之前）。
+     🔴 问用法时**强制拉一次云端**：站长 2026-11-13 改了文案，旧进程要等 5~10 分钟
+     的定时刷新才认，结果连着两次截图都是旧的。问用法是低频操作，多一次请求换「立刻生效」。 */
+  if (/(help|用法|说明|怎么用|怎么查|怎么看|有哪些|全部|所有)/i.test(plain)
+    || /^[\s?？]+$/.test(plain)) {
+    try { await loadSpec(true); } catch { /* 拉不到就用缓存 */ }
+  }
+  const uTxt = usageFor(c, plain);
+  if (uTxt) { await say(chat, uTxt, '[用法] ' + plain.slice(0, 16)); return; }
 
   /* 不是指令 → 看是不是在跟机器人说话（@ 本号 / ai? 前缀）。指令优先，AI 兜底。 */
   if (!c) {
     const q = aiWanted(m, m.body);
-    if (!q) return;
+    if (!q) {
+      /* 🔴 别再静默：带问号 / 看着像指令却没认出来的，留一行日志。
+         不然「机器人不说话」只能靠猜（2026-11-12 整晚都栽在这里）。 */
+      if (/[?？]/.test(plain)) log(`没认出来（不当指令也不当提问）：${plain.slice(0, 40)}`);
+      return;
+    }
     try {
       /* 问「原话」的直出原文；其余交给模型 */
       const raw = await sayRaw(q).catch(() => '');
       if (raw) { await say(chat, raw, '[原话] ' + q.slice(0, 20)); return; }
+      /* 🔴 规则没认出的问法：先让模型判断该查什么（它只回工具名+参数，不碰数据），
+         查得到就直接发；它说不用查，就用它写的那句回。再不行才退回纯聊天。 */
+      const plan = await aiPlan(q, chat);
+      if (plan) {
+        const tk = String(plan.tool || '').toLowerCase();
+        if (tk === 'analyze') {
+          const facts = await factsPack(q, '').catch(() => '');
+          const txt = await askAnalyze(chat, q, facts);
+          if (txt) { await say(chat, txt, '[ai·分析] ' + q.slice(0, 16)); return; }
+        } else if (tk && tk !== 'none') {
+          const txt = await runTool(plan).catch((e) => { log('工具失败：' + (e && e.message)); return ''; });
+          if (txt) { await say(chat, txt, '[工具:' + tk + '] ' + q.slice(0, 16)); return; }
+          log('工具没取到数据：' + tk + ' ' + JSON.stringify(plan.args || {}).slice(0, 60));
+        } else if (plan.reply) {
+          await say(chat, String(plan.reply), '[ai·判不查] ' + q.slice(0, 20));
+          return;
+        }
+      }
       const ans = await askAI(chat, q);
       await say(chat, ans, '[ai] ' + q.slice(0, 24));
     } catch (e) {
       log('AI 失败：' + (e && e.message));
     }
     return;
+  }
+
+  /* `fy?…` 显式查发言（站长 2026-11-13：「fy？用来查询个人 队伍的发言」）
+     🔴 不另写一套判定：剥掉前缀后把整句交给 naturalCmd，它认出的 say/who/when 直接用；
+        认不出才兜底（有队名 ⇒ 队内名单，没队名 ⇒ 当个人去翻原话）。
+        这样 `fy?` 和自然语言问法共用同一份规则，不会一个改了一个没改。 */
+  if (c.kind === 'fy') {
+    const q = String(c.name || '').trim();
+    if (!q) {
+      await say(chat, 'fy? 这样用：\nfy?林舒晴 近3天\nfy?niii 最近半小时\nfy?队伍 g 昨天\nfy?niii 上午11点', '[fy·用法]');
+      return;
+    }
+    let r = null;
+    try { r = await naturalCmd(q); } catch { r = null; }
+    if (!r || !/^(say|who|when)$/.test(String(r.kind))) {
+      const t = teamOf(q);
+      const wq2 = parseWhen(q);
+      const off = /前天/.test(q) ? -2 : (/昨天|昨日/.test(q) ? -1 : (/今天|今日/.test(q) ? 0 : null));
+      if (t && off !== null) r = { kind: 'when', name: JSON.stringify({ team: t, dayOff: off, wholeDay: true }) };
+      else if (t && wq2) r = { kind: 'when', name: JSON.stringify({ team: t, ...wq2 }) };
+      else if (t) r = { kind: 'who', name: String(parseMin(q, 5)), team: t };
+      /* 个人：sayRaw 有 RAW_ASK 闸门（不含「发言/原话」直接返回空），这里补上措辞 */
+      else r = { kind: 'say', name: RAW_ASK.test(q) ? q : q + ' 的发言原话' };
+    }
+    c = r;
   }
 
   /* 「黄宣绮今天说话了吗」——只查这一个人，别回全员名单 */
@@ -850,7 +1772,11 @@ async function handle(ev) {
 
   const u = new URL(WORKER + '/api/cmd');
   u.searchParams.set('k', KEY);
-  u.searchParams.set('q', c.kind + '?' + c.name);
+  /* `raw` = 云端登记的新指令：原文整句发过去，由 worker 自己解析 */
+  u.searchParams.set('q', c.kind === 'raw' ? c.name : (c.kind + '?' + c.name));
+  /* 🔴 必须带上是哪个群在问（2026-11-13 站长：「每个群只能查询自己群里的关注」）：
+     播报名单（关注？/取关？）按群分开记，没有 chat 云端不知道往哪个群加。 */
+  if (chat) u.searchParams.set('chat', chat);
 
   let r = null;
   try {
@@ -863,6 +1789,35 @@ async function handle(ev) {
   if (!r || !r.ok || !r.reply) { log(`无结果 ${c.kind}:${c.name} → ${JSON.stringify(r).slice(0, 100)}`); return; }
 
   await say(chat, r.reply, c.kind + ':' + c.name);
+  /* 指令结果带图（`xfj?` 小房间的〔图〕）：文本发完再逐张补原图。
+     2026-11-14 站长：「图片能不能发出来」—— 只贴一行 [图片] 等于没给。
+     ⚠️ 每张 = 一次 `messages send`，服务端已限到 ≤3 张，这里再兜一层，失败不重试。 */
+  if (Array.isArray(r.imgs) && r.imgs.length) {
+    let okN = 0;
+    for (const im of r.imgs.slice(0, 3)) {
+      if (await sayImage(chat, String(im || ''))) okN++;
+      await sleep(700);
+    }
+    log(`指令补图 ${okN}/${r.imgs.length}（${c.kind}:${c.name}）`);
+  }
+}
+
+/** 发送失败时把微信的**真实原因**挖出来：receipt(JSON) → resourceId → sends get → errorCode。
+ *  2026-11-14 事故：所有群同时「退出码 9」，日志里只有 receipt 路径，谁看都以为代码坏了。
+ *  实际查出来是 `state:failed / errorCode:service_rejected` —— **微信服务端拒收**，
+ *  跟桥、daemon、CLI 都没关系。这个函数就是把那行原因捞回来的。 */
+async function sendDiag(msg) {
+  const m = /Submission receipt:\s*(\S+\.json)/i.exec(String(msg || ''));
+  if (!m) return '';
+  try {
+    const rc = JSON.parse(readFileSync(m[1], 'utf8'));
+    if (!rc || !rc.resourceId) return '';
+    const out = await wx(['--account', ACCOUNT, '--json', 'messages', 'sends', 'get', rc.resourceId], 20000)
+      .catch((e) => String((e && e.message) || e));
+    /* sends get 失败时也是退出码 9，但 stdout 里就是 JSON，jsonOf 能捞出来 */
+    const j = jsonOf(out) || {};
+    return [j.state, j.errorCode].filter(Boolean).join('/');
+  } catch { return ''; }
 }
 
 /** 统一出口：限流 + 截断 + 发送。返回 true = 真发出去了
@@ -870,21 +1825,52 @@ async function handle(ev) {
  *     连续给两个群发时后一条常报 `operation_in_progress`（2026-11-12 实测：
  *     王语晨那条推送到了游戏群、bot小群2 静默丢了）。 */
 async function say(chat, text, tag) {
-  const body = String(text || '').slice(0, 1800);
+  let body = String(text || '').slice(0, 1800);
   if (!body) return false;
+  /* 🔴 本群后缀（2026-11-14 站长：「在群里跟机器人开玩笑加个后缀，这个不要同步到别的群」）：
+     存在 learn[chat].suffix 里，key 就是群 id —— 别的群连读都读不到，物理上串不了群。
+     ⚠️ 只给 AI 聊天类回复加（tag 形如 `[ai] / [ai·分析] / [分析] / [原话]`）；
+        指令结果（榜、鸡腿数）后面挂个玩笑尾巴会很吵，也不像数据。 */
+  const suf = String((learn[chat] && learn[chat].suffix) || '').trim();
+  if (suf && /^\[(?:ai|分析|原话)/.test(String(tag || '')) && body.indexOf(suf) < 0) {
+    body = body.slice(0, 1700) + '\n' + suf;
+  }
   if (DRY) { log(`[dry] 会回 ${chat}：${tag}`); return true; }
+  /* 每调用一次先清标记：只有真被微信拒收时 noteReject() 会把它置 true，
+     上层据此决定「这批别进补发队列」（限流期间补发 = 继续送人头）。 */
+  lastSayRejected = false;
   const gap = Date.now() - (lastSent.get(chat) || 0);
   if (gap < COOLDOWN) await sleep(COOLDOWN - gap);
   lastSent.set(chat, Date.now());
-  for (let i = 1; i <= 3; i++) {
+  /* 🔴 只试 2 次、每次 20 秒：原来 3 次 × 30 秒 = 90 秒，正好撞上 pump() 的
+     90 秒硬上限 ⇒ 整轮被判超时、连「转入补发队列」都来不及执行（2026-11-12 实测）。
+     失败要**快速**返回，交给 retryJobs 下一轮再补。 */
+  /* 🔴 幂等键（2026-11-14）：`messages send` 会返回「退出码 9：Submission receipt: …」——
+     请求已经提交给 daemon，只是这一轮没等到确认。旧代码把它当硬失败立刻重试，
+     一旦第一轮其实已经发出，群里就会出现两条一模一样的答复（同一条指令回两遍）。
+     带上 `--idempotency-key`（同 chat + 同正文 ⇒ 同 key）以后重试是安全的；
+     `--wait` 明确给足 45 秒，让 daemon 有机会在本轮把结果等出来。 */
+  const idem = 'br-' + createHash('sha1').update(chat + '\u0000' + body).digest('hex').slice(0, 24);
+  for (let i = 1; i <= 2; i++) {
     try {
-      await wx(['--account', ACCOUNT, '--json', 'messages', 'send', chat, '--text', body]);
+      await wx(['--account', ACCOUNT, '--json', 'messages', 'send', chat, '--text', body,
+        '--idempotency-key', idem, '--wait', '45'], 55000);
       log(`已回群 ${chat}：${tag}${i > 1 ? '（第 ' + i + ' 次成功）' : ''}`);
+      rejectStreak = 0;
+      if (pauseLevel) log(`✅ 微信恢复发送（原冷却第 ${pauseLevel} 级）⇒ 正常推送，等级清零`);
+      pauseLevel = 0; pushPauseUntil = 0;
       return true;
     } catch (e) {
       const msg = String((e && e.message) || e);
-      log(`回群失败 ${chat}（第 ${i}/3 次）：${msg.slice(0, 120)}`);
-      if (i < 3) await sleep(900 * i);
+      /* receipt = 已提交给 daemon，但这一轮没等到确认 ⇒ 必须再查一次真实结果。
+         `service_rejected` 是微信服务端拒收（小号被限流/风控），**重试毫无用处**，
+         反而加重风控；遇到它立刻收手，并把原因写进日志。 */
+      const receipt = /Submission receipt/i.test(msg);
+      const why = receipt ? await sendDiag(msg) : '';
+      const rejected = /service_rejected|restricted|blocked|forbidden/i.test(why);
+      log(`回群失败 ${chat}（第 ${i}/2 次）${why ? '［' + why + '］' : (receipt ? '［已提交未确认］' : '')}：${msg.slice(0, 200)}`);
+      if (rejected) { lastSayRejected = true; noteReject(); return false; }
+      if (i < 2) await sleep(receipt ? 2000 : 1200);
     }
   }
   return false;
@@ -935,6 +1921,47 @@ pushSeenSet = new Set(pushSeen);
 /** 有没有走过一轮（没走过 = 冷启动，只补最近 15 分钟） */
 let pushBooted = pushSeen.length > 0;
 
+/* 🔴 推送失败**不许丢**（2026-11-12 站长：「现在机器人不会推消息了」）
+   实况：22:49 有一次 `wx` 命令超时 → say() 三次全失败 → 日志「推送失败，已放弃这一批」，
+   而那批 id 早就进了 pushSeen（持久化）⇒ 永久不会重发；云端 `/api/wxb` 取件即清空，
+   也留不下备份。结果就是群友看不到那几条，且谁都不知道丢了。
+   做法：失败的那批留在本地 retryJobs 里，下一轮**优先**补发；同一批最多试 RETRY_MAX 轮。
+   只在内存里，进程重启会丢 —— 够了：真正的死因是「一次超时」，不是进程反复崩。 */
+const retryJobs = [];          // {g, text, imgs, tries, tag}
+const RETRY_MAX = 4;
+
+/** 本轮先把上一轮没发出去的补掉。返回用掉的毫秒数（给外层 90s 上限留余量）。 */
+async function flushRetry(budgetMs) {
+  const t0 = Date.now();
+  while (retryJobs.length) {
+    if (Date.now() - t0 > budgetMs) return;
+    const j = retryJobs[0];
+    let ok = true;
+    if (j.text) ok = await say(j.g, j.text, j.tag + `〔补发${j.tries}〕`);
+    for (const im of (j.imgs || [])) {
+      const gi = await sayImage(j.g, im);
+      if (!gi) ok = false;
+      await sleep(600);
+    }
+    if (ok) {
+      retryJobs.shift();
+      log(`补发成功（${j.g}，第 ${j.tries} 次补发）`);
+      continue;
+    }
+    j.tries++;
+    if (lastSayRejected) {
+      retryJobs.length = 0;
+      log('⚠️ 补发时被微信拒收 ⇒ 清空补发队列，等冷却结束');
+      return;
+    }
+    if (j.tries > RETRY_MAX) {
+      retryJobs.shift();
+      log(`⚠️ 补发 ${RETRY_MAX} 次仍失败，放弃这批（${j.g}）：${String(j.text || '').slice(0, 40)}`);
+    }
+    return;      // 这轮不硬顶，等下一轮
+  }
+}
+
 function saveSeen() {
   try {
     mkdirSync(dirname(PUSH_SEEN_FILE), { recursive: true });
@@ -945,8 +1972,23 @@ function saveSeen() {
 const bjHM = (ms) => new Date((Number(ms) || Date.now()) + 8 * 3600e3)
   .toISOString().slice(11, 16);
 
+/* ---------- 群轮转（2026-11-14 限流解封后改） ----------
+   事故：一轮把 5 个群连着发（相隔 1.2 秒），被微信判成「群发」⇒ service_rejected、整号禁群发。
+   现在：一轮**只发 1 个群**，按顺序轮转，相邻两群隔 5 秒；没轮到的留在 pullBacklog 里，
+   下一拍接着发。群多了只是每个群的延迟变大，**发送速率和只推 1 个群基本一样**。 */
+const pullBacklog = new Map();     // chatId -> items[]（已取件、还没发出去）
+const GROUP_GAP = 5000;            // 相邻两个群之间的最小间隔
+let rr = 0;                        // 轮转游标
+
+function pushOrder() {
+  return PUSH_MAP.size ? [...PUSH_MAP.keys()] : PUSH_GROUPS.slice();
+}
+
 /** 取一次件。items 是 [{id,text,t}]，服务端已经取走即清空 ⇒ 本地 seen 只兜「响应丢了」。 */
 async function pullOnce() {
+  /* ① 先把上一轮没发出去的补掉（给 40 秒预算，别把 90s 硬上限吃光） */
+  await flushRetry(40e3);
+
   const u = new URL(WORKER + '/api/wxb');
   u.searchParams.set('k', KEY);
   u.searchParams.set('s', 'up');           // 服务端只拿它当心跳，5 分钟补写一次，不耗额度
@@ -974,64 +2016,119 @@ async function pullOnce() {
   fresh.sort((a, b) => (Number(a.t) || 0) - (Number(b.t) || 0));
 
   /* 🔴 按「这是谁的动态」分派（2026-11-12 站长：游戏群/bot小群2 收王语晨，bot小群 收黄宣绮）。
-     PUSH_MAP 没配时退回老规则：PUSH_GROUPS 里的群收**所有人**。 */
-  const targets = PUSH_MAP.size ? [...PUSH_MAP.keys()] : PUSH_GROUPS;
+     PUSH_MAP 没配时退回老规则：PUSH_GROUPS 里的群收**所有人**。
+     🔴 2026-11-13 改成「每群一份名单」：空数组 = 这个群**不播任何人**（以前是「全收」），
+        想全收请写 `["*"]`。否则取关到空会把群变回「全收」，等于取关失败。 */
+  if (!jobsFor(fresh).size) {
+    log(`这批 ${fresh.length} 条没有对口的群（who=${[...new Set(fresh.map((x) => x.who || '?'))].join('/')}）`);
+    return;
+  }
+  const n = enqueue(fresh);
+  log(`取件 ${fresh.length} 条 → 排队 ${n} 份，待发 ${pullBacklog.size} 个群（轮转，一轮只发 1 个群）`);
+}
+
+/** 把条目按「这是谁的动态」分派到群。返回 Map<群, items[]>（不落地）。
+    🔴 按人过滤的口径全在这里：PUSH_MAP 没配时退回 PUSH_GROUPS（那群收所有人）。
+    空数组 = 这个群**不播任何人**（想全收写 `["*"]`），否则取关到空会变回「全收」。
+    who 为空 = 老客户端 / 手动通知，不按人过滤，所有推送群都发。 */
+function jobsFor(items) {
+  const targets = pushOrder();
   const jobs = new Map();          // chatId -> items[]
-  for (const it of fresh) {
+  for (const it of items) {
     const who = String(it.who || '').trim();
     for (const g of targets) {
       const whos = PUSH_MAP.get(g) || [];
-      if (whos.length && who && whos.indexOf(who) < 0) continue;   // 这群不收她
+      if (who && whos.indexOf('*') < 0 && whos.indexOf(who) < 0) continue;   // 这群不收她
       if (!jobs.has(g)) jobs.set(g, []);
       jobs.get(g).push(it);
     }
   }
-  if (!jobs.size) {
-    log(`这批 ${fresh.length} 条没有对口的群（who=${[...new Set(fresh.map((x) => x.who || '?'))].join('/')}）`);
-    return;
-  }
+  return jobs;
+}
 
-  const sentTo = [];
+/** 塞进待发队列（同群多条稍后合并成一条发）。 */
+function enqueue(items) {
+  const jobs = jobsFor(items);
+  let n = 0;
   for (const [g, its] of jobs) {
-    /* 同一个群一轮的多条合成一条发：她有时连发五六句，逐条发会把群刷满。
-       每条自带 `[HH:mm:ss] 昵称…` 头，直接空行拼接就行。 */
-    /* 图片条目 text 为空（只有 img），拼文本时跳过，别拼出一堆空行 */
-    const texts = its.map((x) => String(x.text || '')).filter((t) => t.trim());
-    const imgs = its.map((x) => String(x.img || '').trim()).filter(Boolean);
-    const text = (texts.length === 1 ? texts[0]
-      : texts.join('\n\n')).slice(0, 1700);
-
-    /* 🔴 测试/自检文案**永远不进群**（站长 2026-11-12：「这个出现在哪几个群就不要一起发了 不太好哈」）。
-       守卫只认【自检】/【测试】/通道自检/推送通道测试 这几种固定写法，
-       她正常发言里出现「测试」两个字（如「测试一下直播」）不会被误拦。
-       要验证推送，跑 `node wxbot/agent-wechat-bridge.mjs --dry`（只记不发）。 */
-    if (text && /(?:【\s*(?:自检|测试)[^】]*】|通道自检|推送通道测试|推送通道自检)/.test(text)) {
-      log('拦下测试文案，未发群：' + text.replace(/\s+/g, ' ').slice(0, 50));
-      continue;
-    }
-
-    let ok = true;
-    if (text) {
-      /* 日志带上首行摘要：以前只打「[推送] N 条 15:31」，事后根本分不清
-         推的是房间消息还是上下线播报（2026-11-12 排查「上线没推到群」时吃过这个亏）。 */
-      const brief = String(texts[0] || '').replace(/\s+/g, ' ').slice(0, 26);
-      /* 标签按「本批里到底有几条是上下线」算。原来直接对整个 text 做 /[💡🕑]/，
-         只要一批里混了一条上下线，整批都会被标成 [上下线]，看不出混发。 */
-      const onOffN = its.filter((x) => /^[💡🕑]/.test(String(x.text || '').trim())).length;
-      const tag = !onOffN ? '推送' : onOffN === its.length ? '上下线' : `推送+上下线${onOffN}`;
-      ok = await say(g, text, `[${tag}] ${its.length} 条 ${bjHM(its[its.length - 1].t)} ${brief}`);
-      if (!ok) log(`推送失败，已放弃这一批（${g}）`);
-    }
-    /* 文本之后逐张补发真图；一张失败不影响其余 */
-    for (const im of imgs) {
-      const gi = await sayImage(g, im);
-      if (!gi) log(`图片没发出去（${g}）`);
-      await sleep(600);
-    }
-    if (ok) sentTo.push(g);
-    await sleep(1200);   // 别让 daemon 撞车（同时受理一个 send）
+    if (!pullBacklog.has(g)) pullBacklog.set(g, []);
+    const arr = pullBacklog.get(g);
+    for (const it of its) { arr.push(it); n++; }
+    if (arr.length > 60) pullBacklog.set(g, arr.slice(-60));   // 别无限涨
   }
-  log(`推送完成 ${fresh.length} 条 → ${sentTo.length}/${jobs.size} 群`);
+  return n;
+}
+
+/** 发掉**一个**群（按轮转顺序取下一个有货的群）。
+ *  返回 'sent' | 'empty' | 'rejected'；rejected = 微信拒收，上层立刻停手。
+ *  🔴 2026-11-14 限流事故之后改成「一轮只发一个群、群间隔 5 秒」：
+ *     原来一轮 5 个群连着发（间隔 1.2 秒）正是被判成群发的样子。群多了只是延迟变大，
+ *     发送速率和只推 1 个群时基本一样。 */
+async function flushOne() {
+  const order = pushOrder();
+  if (!order.length) return 'empty';
+  for (let k = 0; k < order.length; k++) {
+    const g = order[(rr + k) % order.length];
+    const its = pullBacklog.get(g);
+    if (!its || !its.length) continue;
+    rr = (rr + k + 1) % order.length;      // 下一轮从它后面那个群接着发
+    pullBacklog.delete(g);
+    const r = await sendGroup(g, its);
+    return r === 'rejected' ? 'rejected' : 'sent';
+  }
+  return 'empty';
+}
+
+/** 真正发一个群：合并文本 + 补发图片。 */
+async function sendGroup(g, its) {
+  /* 同一个群一轮的多条合成一条发：她有时连发五六句，逐条发会把群刷满。
+     每条自带 `[HH:mm:ss] 昵称…` 头，直接空行拼接就行。
+     图片条目 text 为空（只有 img），拼文本时跳过，别拼出一堆空行。 */
+  const texts = its.map((x) => String(x.text || '')).filter((t) => t.trim());
+  const imgs = its.map((x) => String(x.img || '').trim()).filter(Boolean);
+  const text = (texts.length === 1 ? texts[0] : texts.join('\n\n')).slice(0, 1700);
+
+  /* 🔴 测试/自检文案**永远不进群**（站长 2026-11-12：「这个出现在哪几个群就不要一起发了 不太好哈」）。
+     守卫只认【自检】/【测试】/通道自检/推送通道测试 这几种固定写法，
+     她正常发言里出现「测试」两个字（如「测试一下直播」）不会被误拦。
+     要验证推送，跑 `node wxbot/agent-wechat-bridge.mjs --dry`（只记不发）。 */
+  if (text && /(?:【\s*(?:自检|测试)[^】]*】|通道自检|推送通道测试|推送通道自检)/.test(text)) {
+    log('拦下测试文案，未发群：' + text.replace(/\s+/g, ' ').slice(0, 50));
+    return 'skipped';
+  }
+
+  let ok = true;
+  if (text) {
+    /* 日志带上首行摘要：以前只打「[推送] N 条 15:31」，事后根本分不清推的是
+       房间消息还是上下线播报（2026-11-12 排查「上线没推到群」时吃过这个亏）。 */
+    const brief = String(texts[0] || '').replace(/\s+/g, ' ').slice(0, 26);
+    /* 标签按「本批里到底有几条是上下线」算。原来直接对整个 text 做 /[💡🕑]/，
+       只要一批里混了一条上下线，整批都会被标成 [上下线]，看不出混发。 */
+    const onOffN = its.filter((x) => /^[💡🕑]/.test(String(x.text || '').trim())).length;
+    const tag = !onOffN ? '推送' : onOffN === its.length ? '上下线' : `推送+上下线${onOffN}`;
+    ok = await say(g, text, `[${tag}] ${its.length} 条 ${bjHM(its[its.length - 1].t)} ${brief}`);
+    if (!ok) {
+      /* 🔴 限流拒收**不进补发队列**：那不是「这次没发成功」，是「这个号现在不许发」，
+         补发一次就多送一次人头，反而拖长限制期。这批 id 已进 pushSeen，所以不会重发
+         —— 限流期间丢几条推送，是可接受的代价。 */
+      if (lastSayRejected) {
+        log(`推送被微信拒收，不再补发（${g}）：${String(text).replace(/\s+/g, ' ').slice(0, 40)}`);
+        return 'rejected';
+      }
+      log(`推送失败，转入补发队列（${g}）`);
+      retryJobs.push({
+        g, text, imgs, tries: 1,
+        tag: `[${tag}] ${its.length} 条 ${bjHM(its[its.length - 1].t)} ${brief}`,
+      });
+    }
+  }
+  /* 文本之后逐张补发真图；一张失败不影响其余 */
+  for (const im of imgs) {
+    const gi = await sayImage(g, im);
+    if (!gi) log(`图片没发出去（${g}）`);
+    await sleep(600);
+  }
+  return ok ? 'ok' : 'failed';
 }
 
 /** 长轮询：每 PUSH_EVERY 秒一次，永不退出；单次异常只记日志，不影响下一条 */
@@ -1039,9 +2136,12 @@ async function pump() {
   const desc = PUSH_MAP.size
     ? [...PUSH_MAP.entries()].map(([g, ws]) => g + '←' + (ws.join('|') || '全部')).join('，')
     : (PUSH_GROUPS.join(',') || '关（没配 WX_PUSH_GROUPS / WX_PUSH_MAP）');
-  log(`推送通道：${desc}，每 ${Math.round(PUSH_EVERY / 1000)} 秒取件`);
+  log(`推送通道：${desc}，每 ${Math.round(PUSH_EVERY / 1000)} 秒取件（一轮只发 1 个群，轮转，群间隔 ${GROUP_GAP / 1000}s）`);
   if (!PUSH_MAP.size && !PUSH_GROUPS.length) return;
   for (;;) {
+    /* 被微信连续拒收期间**不要取件**：取出来也发不出去，只会堆进 retryJobs 并在
+       下一轮重放，等于持续给风控送人头。留在云端队列里等解封后一次性发更划算。 */
+    if (Date.now() < pushPauseUntil) { await sleep(15000); continue; }
     try {
       /* 🔴 硬超时兜底：pullOnce 里只要有一次 `wx` 调用卡住，整个取件循环就永久停摆，
          队列里的推送会一直躺着（2026-11-12 实测：16:00 的下线播报在队列里躺了
@@ -1051,8 +2151,292 @@ async function pump() {
         pullOnce(),
         sleep(90e3).then(() => { throw new Error('取件超时 90s，重开一轮'); }),
       ]);
+      /* 把待发队列按轮转发完：一轮一个群、群间隔 GROUP_GAP；被拒立刻停手（冷却交给 noteReject） */
+      while (pullBacklog.size) {
+        const r = await flushOne();
+        if (r !== 'sent') break;
+        if (pullBacklog.size) await sleep(GROUP_GAP);
+      }
     } catch (e) { log('取件异常：' + (e && e.message)); }
     await sleep(PUSH_EVERY);
+  }
+}
+
+/* ---------------- 远程控制台（桥侧执行器） ----------------
+   站长 2026-11-13：「那台电脑我不一定在，能不能远程操控？」
+
+   能，而且不用公网 IP / 内网穿透 / SSH —— 桥本来就一直往云端取件（推送走 /api/wxb），
+   控制通道照同一个形状做：**云端排队 → 桥 10 秒轮询 → 本地跑 → 回传结果**。
+   云端只负责排队，永远不直接连这台机器。
+
+   🔴 只认下面 switch 里那几个 op，**不接任意 shell**。
+   🔴 restart / update 是「先回传结果再退出」：容器是 --restart unless-stopped，
+      退出即自动拉起，等于远程重启，不需要容器里有 docker 命令。 */
+
+const CTL_EVERY = 10 * 1000;
+const SELF = String(process.argv[1] || '');
+const QR_BASE = '/tmp/all48-login-qr.png';
+
+/* 版本 = 自身文件 sha1 前 8 位。改没改一眼看得出来，不用手工维护版本号。 */
+let SELF_VER = '';
+try { SELF_VER = createHash('sha1').update(readFileSync(SELF)).digest('hex').slice(0, 8); } catch { }
+
+/* 登录态缓存：`wx accounts list` 一次要 0.5~2 秒，不能 10 秒跑一次 */
+let AUTH = { at: 0, online: false, groups: 0, raw: '' };
+
+async function ctlAuth(force) {
+  if (!force && Date.now() - AUTH.at < 60e3) return AUTH;
+  try {
+    /* 用 list 而不是 status：deploy 脚本里一直用 `Authenticated: Yes` 判断，行格式是验证过的 */
+    const out = await wx(['accounts', 'list'], 15000);
+    const online = /Authenticated:\s*Yes/i.test(out);
+    const conn = (/Connection:\s*(.+)/i.exec(out) || [])[1] || '';
+    AUTH = {
+      at: Date.now(), online, groups: AUTH.groups,
+      raw: (online ? '在线' : '离线') + (conn ? '（' + conn.trim().slice(0, 24) + '）' : ''),
+    };
+  } catch (e) {
+    AUTH = { at: Date.now(), online: false, groups: AUTH.groups, raw: '读到失败：' + String((e && e.message) || e).slice(0, 80) };
+  }
+  return AUTH;
+}
+
+function fmtSpan(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+}
+
+/** 二维码文件：`--qr-output x.png` 首次是 x.png，自动刷新会写 x-1.png / x-2.png…
+ *  取**最新**那个，否则扫码时看到的是早就过期的那张。 */
+function newestQr() {
+  try {
+    const dir = '/tmp';
+    const base = 'all48-login-qr';
+    let best = null, bt = -1;
+    for (const f of readdirSync(dir)) {
+      if (f !== base + '.png' && !new RegExp('^' + base + '-\\d+\\.png$').test(f)) continue;
+      try {
+        const st = statSync(dir + '/' + f);
+        if (st.mtimeMs > bt) { bt = st.mtimeMs; best = dir + '/' + f; }
+      } catch { }
+    }
+    return best;
+  } catch { return null; }
+}
+
+async function ctlRes(R) {
+  try {
+    const u = new URL(WORKER + '/api/ctl/res');
+    u.searchParams.set('k', KEY);
+    await fetch(u, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(R),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch { /* 回传失败就算了，别把循环带崩 */ }
+}
+
+/** 执行一条指令。返回 true 表示这条会退出进程（重启/更新），调用方别再往下跑。 */
+async function ctlRun(c) {
+  const op = String(c.op || '');
+  const t0 = Date.now();
+  const R = { id: c.id, op, ok: false, out: '' };
+  let quit = false;
+
+  try {
+    if (op === 'status') {
+      const a = await ctlAuth(true);
+      R.info = {
+        account: ACCOUNT, online: !!a.online, ver: SELF_VER,
+        up: Math.round(process.uptime()), groups: AUTH.groups || 0,
+      };
+      R.out = [
+        '账号　' + ACCOUNT,
+        '登录　' + (a.online ? '已登录 / 在线' : '未登录 / 断开'),
+        '进程　已跑 ' + fmtSpan(process.uptime()),
+        '版本　' + (SELF_VER || '?'),
+        '队列　推送 ' + (PUSH_MAP.size || PUSH_GROUPS.length ? '开' : '关')
+          + '（每 ' + Math.round(PUSH_EVERY / 1000) + ' 秒）· AI ' + (AI_ON ? '开' : '关'),
+        a.raw ? 'CLI　 ' + a.raw : '',
+      ].filter(Boolean).join('\n');
+      R.ok = true;
+
+    } else if (op === 'qr') {
+      try { unlinkSync(QR_BASE); } catch { }
+      /* --detach：立即返回，不阻塞 5 分钟等扫码；--force-qr：跳过设备信任，强制出码 */
+      const out = await wx(['auth', 'login', '--strategy', 'qr', '--force-qr',
+        '--qr-output', QR_BASE, '--detach', '--json'], 30000);
+      let f = null;
+      for (let i = 0; i < 30 && !f; i++) { await sleep(500); f = newestQr(); }
+      if (!f) {
+        R.out = '没等到二维码文件。CLI 原始输出：\n' + String(out || '').slice(0, 800);
+      } else {
+        const b64 = readFileSync(f).toString('base64');
+        R.qr = 'data:image/png;base64,' + b64;
+        R.out = '二维码已生成（' + Math.round(b64.length / 1024) + 'KB）：用手机微信「扫一扫」扫上面的图。'
+          + '\n二维码约 2 分钟过期，过期再点一次即可。';
+        R.ok = true;
+      }
+
+    } else if (op === 'groups') {
+      const out = await wx(['--json', 'groups', 'list'], 30000);
+      const j = jsonOf(out);
+      const arr = Array.isArray(j) ? j
+        : (j && (j.items || j.groups || j.list || j.entries)) || [];
+      if (!Array.isArray(arr) || !arr.length) {
+        R.out = '没解析出群列表。CLI 原始输出：\n' + String(out || '').slice(0, 900);
+      } else {
+        R.groups = arr.slice(0, 300).map((g) => ({
+          n: String(g.name || g.nickname || g.displayName || g.topic || g.title || g.id || ''),
+          id: String(g.id || g.chatId || g.groupId || ''),
+          m: Number(g.memberCount || g.membersCount || g.members || 0) || '',
+        }));
+        AUTH.groups = arr.length;
+        R.out = '共 ' + arr.length + ' 个群，已同步到上面的列表。';
+        R.ok = true;
+      }
+
+    } else if (op === 'logs') {
+      const txt = existsSync(LOG_FILE) ? readFileSync(LOG_FILE, 'utf8') : '';
+      /* 行数可调（默认 60）：排查「某条指令为什么没回」时要往前翻到那条消息，
+         60 行只够 5 分钟，一转眼就被推送日志挤掉了（2026-11-14）。上限 400 防撑爆回传。
+         ⚠️ 参数得从 `args` 里取：CtlDO 只存 args，顶层 `n` 在云端就被丢了。 */
+      const want = Math.min(400, Math.max(10, Number(c.args && (c.args.n || c.args[0])) || 60));
+      const ln = txt.split('\n').filter((x) => x.trim()).slice(-want);
+      R.out = ln.length ? ln.join('\n') : '（还没有日志）';
+      R.ok = true;
+
+    } else if (op === 'file') {
+      /* 🔴 只读文本，只允许 /app/data 下的 .json/.log —— 用来读 CLI 写下的
+         `receipts/*.json`（发送凭据）。排查「exit 9 / Submission receipt」时，
+         receipt 里写着这次发送到底 pending 还是 failed，比猜一百遍都快。
+         ⚠️ 云端 CtlDO 只透传 `args` 字段（其它字段在 /cmd 就被丢掉了），
+            所以路径必须放在 `args` 里：{op:'file', args:{p:'/app/data/xxx.json'}}。 */
+      const f = String((c.args && (c.args.p || c.args.path || c.args[0])) || '').slice(0, 300);
+      if (!/^\/app\/data\/[\w./-]+\.(json|log)$/.test(f) || f.indexOf('..') >= 0) {
+        R.out = 'file 只允许读 /app/data 下的 .json / .log';
+      } else if (!existsSync(f)) {
+        R.out = '文件不存在：' + f;
+      } else {
+        const t = readFileSync(f, 'utf8');
+        R.out = (t.length > 1600 ? t.slice(0, 1600) + '\n…（共 ' + t.length + ' 字）' : t);
+        R.ok = true;
+      }
+
+    } else if (op === 'wxraw') {
+      /* 🔴 只读诊断口：把一条 wx 子命令的**原始 stdout/退出码**回传，用来判断
+         「退出码 9 / Submission receipt」到底是没发出去、还是已提交没等到确认。
+         白名单只放只读子命令；`messages send` 单独允许（排查发送必须用它），
+         其他一律拒 —— 绝不能变成任意 shell。 */
+      const a2 = (Array.isArray(c.args) ? c.args : []).map((x) => String(x).slice(0, 300)).slice(0, 12);
+      const head = String(a2[0] || '');
+      if (!/^(operations|jobs|status|chats|messages|accounts|version|auth|daemon)$/.test(head)) {
+        R.out = 'wxraw 只允许：operations / jobs / status / chats / messages / accounts / version / auth / daemon';
+      } else {
+        let o2 = '', e2 = '';
+        try {
+          o2 = await wx(['--account', ACCOUNT, '--json', ...a2], 90000);
+        } catch (e) { e2 = String((e && e.message) || e); }
+        let txt = '$ wx --json ' + a2.join(' ') + '\n' + (o2 || e2);
+        /* 🔴 超长要**留尾部**：`daemon logs` 一次能吐几万字，错误永远在最后几行，
+           截前 1800 字等于只看到整篇日志的开头（2026-11-14 白跑一次）。 */
+        if (txt.length > 1800) {
+          txt = txt.slice(0, 400) + '\n…（中间省略 ' + (txt.length - 1700) + ' 字）…\n' + txt.slice(-1300);
+        }
+        R.out = txt;
+        R.ok = !e2;
+      }
+
+    } else if (op === 'restart') {
+      R.out = '已收到重启指令，3 秒后重启（容器 unless-stopped 会自己拉起来）';
+      R.ok = true;
+      R.ms = Date.now() - t0;
+      await ctlRes(R);
+      log('控制台：收到重启指令');
+      setTimeout(() => process.exit(0), 1200);
+      return true;
+
+    } else if (op === 'update') {
+      const r = await fetch(WORKER + '/api/wb/bridge-k7f2', { signal: AbortSignal.timeout(40000) });
+      if (!r.ok) throw new Error('下载失败 HTTP ' + r.status);
+      const txt = await r.text();
+      if (txt.length < 20000 || !/agent-wechat/.test(txt.slice(0, 1200))) {
+        throw new Error('下载到的不是桥程序（' + txt.length + 'B）');
+      }
+      const next = createHash('sha1').update(txt).digest('hex').slice(0, 8);
+      if (next === SELF_VER) {
+        R.out = '云端就是当前版本（' + next + '），不用更新。';
+        R.ok = true;
+      } else {
+        /* 🔴 临时文件必须还是 `.mjs` 结尾：写成 `xxx.mjs.next` 时 node --check 会报
+           ERR_UNKNOWN_FILE_EXTENSION（它按扩展名判模块类型），于是**每次更新都失败**，
+           桥永远停在旧版（2026-11-13 排查「关注？回了『要在群里发』」时才发现的）。 */
+        const tmp = SELF.replace(/\.mjs$/, '') + '.next.mjs';
+        writeFileSync(tmp, txt);
+        /* 🔴 先 node --check：语法不过关就绝不覆盖，否则容器会陷入无限重启，
+           而那时人不在机器旁边，只能干看着。 */
+        await new Promise((res, rej) => {
+          const p = spawn(process.execPath, ['--check', tmp], { stdio: 'ignore' });
+          p.on('error', rej);
+          p.on('close', (code) => (code === 0 ? res() : rej(new Error('新文件语法检查没过（退出码 ' + code + '）'))));
+        });
+        const bak = SELF + '.bak.' + new Date().toISOString().slice(11, 16).replace(/[:]/g, '');
+        writeFileSync(bak, readFileSync(SELF));
+        writeFileSync(SELF, txt);
+        try { unlinkSync(tmp); } catch { }
+        R.out = '已更新：' + SELF_VER + ' → ' + next + '\n旧版留在 ' + bak.split('/').pop() + '，1 秒后重启生效。';
+        R.ok = true;
+        R.ms = Date.now() - t0;
+        await ctlRes(R);
+        log('控制台：更新完成 ' + SELF_VER + ' → ' + next + '，重启');
+        setTimeout(() => process.exit(0), 1200);
+        return true;
+      }
+
+    } else {
+      R.out = '不认识的指令：' + op;
+    }
+  } catch (e) {
+    R.out = '执行失败：' + String((e && e.message) || e).slice(0, 400);
+  }
+
+  if (quit) return true;
+  R.ms = Date.now() - t0;
+  await ctlRes(R);
+  log('控制台：' + (R.ok ? '完成' : '失败') + ' ' + op + ' ' + R.ms + 'ms');
+  return false;
+}
+
+async function ctlOnce() {
+  const a = await ctlAuth(false);
+  const u = new URL(WORKER + '/api/ctl/poll');
+  u.searchParams.set('k', KEY);
+  const r = await fetch(u, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      account: ACCOUNT, online: !!a.online, groups: AUTH.groups || 0,
+      ver: SELF_VER, up: Math.round(process.uptime()),
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const d = await r.json().catch(() => null);
+  if (!d || !d.ok) return;
+  for (const c of (Array.isArray(d.cmds) ? d.cmds : [])) {
+    const quit = await ctlRun(c);
+    if (quit) return;
+  }
+}
+
+async function ctlLoop() {
+  if (!KEY) return;
+  log('控制台：已接管，每 ' + Math.round(CTL_EVERY / 1000) + ' 秒取一次指令');
+  for (;;) {
+    try { await ctlOnce(); } catch { /* 网络抖动不刷屏，下一轮再说 */ }
+    await sleep(CTL_EVERY);
   }
 }
 
@@ -1087,6 +2471,7 @@ function watch() {
 
   let buf = '';
   let chain = Promise.resolve();       // 串行处理，别并发开一堆 wx 进程
+  const oddKind = new Set();           // 每种没认的事件类型只提示一次，免得刷屏
 
   p.stdout.on('data', (chunk) => {
     buf += chunk;
@@ -1097,8 +2482,20 @@ function watch() {
       if (!line || line[0] !== '{') continue;
       let ev;
       try { ev = JSON.parse(line); } catch { continue; }
-      if (ev.kind !== 'message.committed') continue;
-      chain = chain.then(() => handle(ev)).catch((e) => log('处理异常：' + (e && e.message)));
+      if (ev.kind !== 'message.committed') {
+        /* 🔴 事件类型对不上时以前是直接 continue，等于「事件流在跑但一条都不用」，
+           日志上完全看不出来。现在每种类型提示一次。 */
+        if (ev.kind && !oddKind.has(ev.kind)) {
+          oddKind.add(ev.kind);
+          log('忽略事件类型：' + String(ev.kind).slice(0, 40));
+        }
+        continue;
+      }
+      chain = chain.then(() => handle(ev)).catch((e) => {
+        /* 🔴 打全栈：只打 message 的话（`msgTimeMs is not defined`）看不出在哪一行，
+           上次就是这么瞎猜了一晚。 */
+        log('处理异常：' + String((e && (e.stack || e.message)) || e).split('\n').slice(0, 4).join(' | '));
+      });
     }
   });
   p.stderr.on('data', (d) => {
@@ -1116,4 +2513,24 @@ function watch() {
 }
 
 if (PING) { await ping(); }
-else { pump(); watch(); }
+else {
+  /* 指令前缀表：启动先拉一次，之后每 5 分钟刷新（内部 TTL 10 分钟，双保险）。
+     拉不到就用文件缓存 / 内置默认，绝不影响启动。 */
+  void loadSpec(true);
+  setInterval(() => { void loadSpec(); }, 2 * 60 * 1000);
+  /* 云端配置：启动先取一次（10 秒超时，拉不到就用 env），之后每 5 分钟刷。
+     放在 pump/watch 之前 —— 这样「启动：…群=…」那行打的就是**生效后**的值。 */
+  /* 先吃上次缓存（断网也有配置），再问云端要最新的一份 */
+  if (!(await loadCfg(true)) && cachedCfg) {
+    cfgApply(cachedCfg);
+    log('沿用上次缓存的云端配置（v' + (cachedCfg.v || 1) + '）');
+  }
+  if (!cachedCfg) {
+    cfgApply(CFG_DEFAULTS);
+    log('⚠️ 从没拿到过云端配置，先用内置默认跑（指令群=全部，推送=关）');
+  }
+  setInterval(() => { void loadCfg(); }, 5 * 60 * 1000);
+  pump();
+  void ctlLoop();
+  watch();
+}

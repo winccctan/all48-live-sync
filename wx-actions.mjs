@@ -439,8 +439,12 @@ async function tickOne(w, st, lives, first) {
         }
         /* 同一批发给 worker 留档（`xfj?` 查历史用）。带频道号 + 频道名，
            一个成员有两个以上小房间时，回复里能分得清是哪间。 */
+        /* 🔴 图片要把 NOS 直链一起带上去（2026-11-14 站长：「图片能不能发出来」）。
+           只留 `[图片]` 两个字，`xfj?` 查历史时就没图可发 —— 存档里必须存 url。 */
         for (const it of msgs) {
-          smOut.push({ t: it.t, x: String(it.text || '').slice(0, 300), c: sc.ch, cn: String(sc.name || '').slice(0, 20) });
+          const rec = { t: it.t, x: String(it.text || '').slice(0, 300), c: sc.ch, cn: String(sc.name || '').slice(0, 20) };
+          if (it.img) rec.img = String(it.img).slice(0, 300);
+          smOut.push(rec);
         }
       } else if (!st[key] || Number(st[key]) < floor) {
         next[key] = now;
