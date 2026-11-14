@@ -257,7 +257,7 @@ function viewFromNim(d, ext) {
 
   const o = { t, k, x: '', i: null, r: null, c: null, a: '', v: '' };
   if (k === 'TEXT') { o.x = body; return o; }
-  if (!att) { o.x = body; o.k = body ? 'TEXT' : 'UNKNOWN'; return o; }
+  if (!att) { o.x = body; o.k = body ? 'TEXT' : 'UNKNOWN'; if (!o.x) return null; return o; }
 
   const src = att.content && typeof att.content === 'object' ? att.content : att;
 
@@ -285,17 +285,23 @@ function viewFromNim(d, ext) {
       o.c = ['分享', s(src.title, src.postsTitle, src.text) || '分享', url(s(src.pic, src.cover, ''))];
       break;
     default: {
-      // 翻牌 / 卡片 / AI 对话 …：尽量把可读文本挖出来，挖不到就保留类型标记（不静默丢）
+      // 翻牌 / 卡片 / AI 对话 / 新图片类型 …：尽量把可读文本挖出来
       const x = s(src.answer, src.text, src.content, src.desc, src.title, src.question, '');
-      o.x = typeof x === 'string' ? x : '';
-      if (!o.x) { msgUnknown += 1; o.x = '[' + (LABEL[k] || k) + ']'; }
       o.a = url(s(src.audio, src.audioUrl, ''));
       o.v = url(s(src.video, src.videoUrl, ''));
       if (src.pic || src.cover || src.url) o.i = [url(s(src.pic, src.cover, src.url))];
+      /* 🔴 2026-11-14 站长截图：房间发图片，微信里先来一行「[UNKNOWN]」再来图。
+         根因：图片走的是没登记的消息类型，这里挖不到文本就无条件打类型标记，
+         但紧接着图片又单独发了一条 ⇒ 用户看到两条，第一条还是乱码。
+         现在：能取到图/语音/视频就**只发媒体**，一个字都不多打；
+         真的什么内容都没有，才留类型标记（这类才算真未知，值得看一眼）。 */
+      if (typeof x === 'string' && x) { o.x = x; }
+      else if (o.i || o.a || o.v) { o.x = ''; if (k === 'UNKNOWN') o.k = o.i ? 'IMAGE' : (o.a ? 'AUDIO' : 'VIDEO'); }
+      else { msgUnknown += 1; o.x = '[' + (LABEL[k] || k) + ']'; }
       break;
     }
   }
-  if (!o.x && !o.i && !o.a && !o.v) o.x = '[' + (LABEL[k] || k) + ']';
+  if (!o.x && !o.i && !o.a && !o.v) o.x = k === 'UNKNOWN' ? '' : '[' + (LABEL[k] || k) + ']';
   return o;
 }
 
@@ -311,6 +317,7 @@ function pushMsg(d, p) {
   msgSeen.add(key);
 
   const v = viewFromNim(d, p?.merged || {});
+  if (!v) return;            // 完全没内容的消息（解码不出任何东西）不入库、不推微信
   let arr = msgQ.get(uid);
   if (!arr) { arr = []; msgQ.set(uid, arr); }
   arr.push(v);
@@ -328,11 +335,40 @@ function pushMsg(d, p) {
  *    Worker 的 /api/wxq/push 按 id 去重，两条通道同时开也只会发一条。
  *    ⇒ 常驻端挂了还有 Actions 兜底，不会因为「切到推送」就断消息。
  */
-const WX_ROOM = new Map(
+/* 🔴 2026-11-14 站长：「取关了怎么还会抓」。
+   以前这里是**写死**的两个人（env `WX_ROOM_UIDS`），云端名单改了这里毫无反应 ——
+   群里取关只是把云端名册删掉，这条快通道照旧按写死的名单抓、照旧往队列里投。
+   现在改成**跟云端走**：启动拉一次 `/api/wxwatch`，之后每 5 分钟对一次；
+   云端名册空了（全部群都取关）就退回 env，避免一次网络抖动把推送全停掉。 */
+let WX_ROOM = new Map(
   String(process.env.WX_ROOM_UIDS || '89653517:王语晨,45285685:黄宣绮')
     .split(',').map((s) => s.split(':')).filter((a) => a.length === 2)
     .map(([u, n]) => [Number(u), n.trim()])
 );
+const WX_ROOM_ENV = new Map(WX_ROOM);
+
+async function wxRoomLoad() {
+  try {
+    const r = await fetch(SITE + '/api/wxwatch', {
+      headers: { 'x-ingest-token': INGEST }, signal: AbortSignal.timeout(15000),
+    });
+    const j = await r.json().catch(() => null);
+    const list = (j && Array.isArray(j.list)) ? j.list : [];
+    const m = new Map();
+    for (const it of list) {
+      const uid = Number((it && it.uid) || 0);
+      const nick = String((it && it.nick) || '').trim();
+      if (uid && nick) m.set(uid, nick);
+    }
+    if (!m.size) { log('[WX] 云端名单是空的 ⇒ 退回 env 名单（' + [...WX_ROOM_ENV.values()].join('、') + '）'); WX_ROOM = new Map(WX_ROOM_ENV); return; }
+    const before = [...WX_ROOM.keys()].sort().join(',');
+    const after = [...m.keys()].sort().join(',');
+    WX_ROOM = m;
+    if (before !== after) log('[WX] 播报名单已更新：' + [...m.values()].join('、'));
+  } catch (e) {
+    log('[WX] 拉云端名单失败（沿用当前名单）：' + String((e && e.message) || e).slice(0, 60));
+  }
+}
 const WX_PUSH_OFF = process.env.NO_WX_PUSH === '1' || DRY;
 const wxBuf = [];
 let wxFail = 0;
@@ -392,6 +428,11 @@ async function flushWx() {
   }
 }
 setInterval(() => { flushWx().catch((e) => log('[WX] flush 异常 ' + String(e?.message || e).slice(0, 50))); }, 900);
+/* 播报名单每 5 分钟跟云端对一次（取关/关注在群里改完，这里最慢 5 分钟跟上）。 */
+if (INGEST) {
+  setTimeout(() => { void wxRoomLoad(); }, 3000);
+  setInterval(() => { void wxRoomLoad(); }, 5 * 60e3);
+}
 
 
 /* 上报：{ msgs: { uid: [view…] } }，与 sync.mjs 完全同一口径、同一去重（t|k） */

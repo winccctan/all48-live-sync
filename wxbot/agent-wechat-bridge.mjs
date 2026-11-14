@@ -1789,6 +1789,13 @@ async function handle(ev) {
   if (!r || !r.ok || !r.reply) { log(`无结果 ${c.kind}:${c.name} → ${JSON.stringify(r).slice(0, 100)}`); return; }
 
   await say(chat, r.reply, c.kind + ':' + c.name);
+  /* 🔴 2026-11-14 站长：「取关了怎么还会抓」。
+     根因不是没删，而是**桥这边的推送表还是旧的**：pushMap 每 5 分钟才从云端拉一次，
+     取关成功后那几分钟里桥照旧把她的消息往这个群发 —— 用户看到的就是「取关没用」。
+     关注/取关改的是云端名单，改完立刻重拉一次，下一件就开始按新名单分发了。 */
+  if (c.kind === 'raw' && /^\s*(关注|取关)/.test(String(c.name || ''))) {
+    setTimeout(() => { loadCfg(true).catch(() => {}); }, 300);
+  }
   /* 指令结果带图（`xfj?` 小房间的〔图〕）：文本发完再逐张补原图。
      2026-11-14 站长：「图片能不能发出来」—— 只贴一行 [图片] 等于没给。
      ⚠️ 每张 = 一次 `messages send`，服务端已限到 ≤3 张，这里再兜一层，失败不重试。 */
@@ -2350,6 +2357,46 @@ async function ctlRun(c) {
         R.ok = !e2;
       }
 
+    } else if (op === 'exec') {
+      /* 🔴 容器内的通用执行口（2026-11-14 新增，为了把 nim-client 搬上来）。
+         上面几个口是「白名单只读」，这个口不是 —— 它等于容器里一个 shell。
+         为什么必须有：这台机器没有任何其它入站方式（SSH 不在我们手里），
+         而要在上面装第二个常驻进程（云信长连接 → 微信秒推），只能靠它下发文件+起进程。
+         风险边界：和 `restart` 同级别 —— 都是拿到控制口令才能下发。
+         ⇒ 每条都写日志（谁在什么时候跑了什么），参数只从 `args` 取（CtlDO 只存 args）。
+         用法：{op:'exec', args:{cmd:'node -v; pwd', timeout:60}} */
+      const cmd = String((c.args && (c.args.cmd || c.args[0])) || '');
+      const to = Math.min(300, Math.max(5, Number(c.args && c.args.timeout) || 60)) * 1000;
+      if (!cmd) {
+        R.out = 'exec 需要 args.cmd';
+      } else if (cmd.length > 400000) {
+        R.out = 'cmd 太长（' + cmd.length + ' 字节，上限 400000）';
+      } else {
+        const r = await new Promise((res) => {
+          let out = '', err = '', done = false;
+          const fin = (code, timed) => {
+            if (done) return;
+            done = true;
+            try { p.kill('SIGKILL'); } catch { }
+            res({ code, out, err, timed });
+          };
+          const p = spawn('/bin/sh', ['-c', cmd], { cwd: '/app', env: process.env });
+          const tm = setTimeout(() => fin(null, true), to);
+          p.stdout.on('data', (d) => { if (out.length < 120000) out += d.toString(); });
+          p.stderr.on('data', (d) => { if (err.length < 30000) err += d.toString(); });
+          p.on('error', (e) => { err += 'spawn 失败：' + String((e && e.message) || e); fin(-1, false); });
+          p.on('close', (code) => { clearTimeout(tm); fin(code, false); });
+        });
+        /* 回传只留尾部：装依赖/编译时前面几千行都是噪音，错误永远在最后 */
+        let txt = 'exit=' + (r.timed ? 'TIMEOUT(' + Math.round(to / 1000) + 's)' : r.code) + '\n' + (r.out || '');
+        if (r.err) txt += '\n[stderr] ' + r.err;
+        if (txt.length > 6000) txt = txt.slice(0, 800) + '\n…（省略 ' + (txt.length - 6800) + ' 字）…\n' + txt.slice(-5200);
+        R.out = txt;
+        R.ok = !r.timed && r.code === 0;
+        R.ms = Date.now() - t0;
+        log('控制台：exec「' + cmd.replace(/\s+/g, ' ').slice(0, 80) + '」→ ' + (r.timed ? '超时' : 'exit ' + r.code));
+      }
+
     } else if (op === 'restart') {
       R.out = '已收到重启指令，3 秒后重启（容器 unless-stopped 会自己拉起来）';
       R.ok = true;
@@ -2530,6 +2577,20 @@ else {
     log('⚠️ 从没拿到过云端配置，先用内置默认跑（指令群=全部，推送=关）');
   }
   setInterval(() => { void loadCfg(); }, 5 * 60 * 1000);
+
+  /* 随容器一起起「外挂服务」（2026-11-14）：容器 unless-stopped，桥重启=这些进程全没了，
+     所以在桥启动时把它们拉起来。现在只有一个：云信长连接（成员发言 → 微信秒推）。
+     判存在才起，脚本自己 nohup + 死循环重生；起不来也不影响桥本身。 */
+  try {
+    if (existsSync('/app/nim/run.sh')) {
+      const p = spawn('/bin/sh', ['/app/nim/run.sh'], { detached: true, stdio: 'ignore' });
+      p.unref();
+      log('外挂服务：已拉起 nim（云信长连接 → 微信秒推）');
+    }
+  } catch (e) {
+    log('外挂服务拉起失败：' + String((e && e.message) || e).slice(0, 100));
+  }
+
   pump();
   void ctlLoop();
   watch();
