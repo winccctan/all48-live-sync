@@ -215,7 +215,9 @@ let SPEC = { at: 0, prefixes: SPEC_DEFAULT.slice(), v: 0, usage: {} };
 const specUsage = (o) => {
   const out = {};
   if (o && typeof o === 'object' && !Array.isArray(o)) {
-    for (const k of Object.keys(o).slice(0, 12)) {
+    /* 🔴 上限 12 → 20（2026-11-15）：云端加了 zb/nb 正好挤满 12 条，第 13 条起会被这里静默截掉，
+       表现就是「指令能查，但『zb 用法』不回答」。 */
+    for (const k of Object.keys(o).slice(0, 20)) {
       const v = String(o[k] || '');
       if (k && v) out[String(k).slice(0, 20)] = v.slice(0, 600);
     }
@@ -1789,6 +1791,15 @@ async function handle(ev) {
   if (!r || !r.ok || !r.reply) { log(`无结果 ${c.kind}:${c.name} → ${JSON.stringify(r).slice(0, 100)}`); return; }
 
   await say(chat, r.reply, c.kind + ':' + c.name);
+  /* 🔴 2026-11-15 站长：「一段话放不完，你可以分两条消息啊」。
+     worker 用 `parts` 表示分段（`nb?group` 全站在播几百场，一条 1800 字塞不下），
+     这里把第 2 段起逐条补发。上限 6 段，失败不重试 —— 重发一条长的更容易被微信拒。 */
+  if (Array.isArray(r.parts) && r.parts.length > 1) {
+    for (const p of r.parts.slice(1, 6)) {
+      await sleep(900);
+      await say(chat, String(p || ''), c.kind + ':' + c.name + ' 续');
+    }
+  }
   /* 🔴 2026-11-14 站长：「取关了怎么还会抓」。
      根因不是没删，而是**桥这边的推送表还是旧的**：pushMap 每 5 分钟才从云端拉一次，
      取关成功后那几分钟里桥照旧把她的消息往这个群发 —— 用户看到的就是「取关没用」。
