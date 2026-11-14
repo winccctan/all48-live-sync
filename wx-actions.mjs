@@ -228,12 +228,13 @@ function line(m) {
   return { t: Number(m.msgTime) || 0, text: content, img };
 }
 
-/** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光） */
-async function collect(since, w) {
+/** 取 since 之后本人发的消息（最多往回翻 6 页，避免 runner 时间被吃光）
+ *  ch 省略 = 大房间；给了 ch 就拉那个频道（小房间用）。 */
+async function collect(since, w, ch) {
   const out = [];
   let nextTime = 0;
   for (let p = 0; p < 6; p++) {
-    const r = await fetchMessagePage({ serverId: w.srv, channelId: w.ch, nextTime, limit: 50, token: TOKEN });
+    const r = await fetchMessagePage({ serverId: w.srv, channelId: ch || w.ch, nextTime, limit: 50, token: TOKEN });
     const msgs = (r && r.messages) || [];
     if (!msgs.length) break;
     let oldest = Infinity;
@@ -251,6 +252,31 @@ async function collect(since, w) {
     await sleep(150);
   }
   return out.sort((a, b) => a.t - b.t);
+}
+
+/* ---------------- 小房间 ----------------
+ * 2026-11-14 站长：「机器人可以抓到小房间的发言吗，你用我的账号应该可以看到小房间的消息的」。
+ * 口袋48 一个成员的 server 下可以有多个频道：
+ *   大房间 = 名册里的 ch（公开，谁都能进）
+ *   小房间 = 需要「进过这个房间」的账号才看得到（站长自己的号进了一部分）
+ * 频道 id 名册里没有、还会变 ⇒ 每轮向 seine 详情问一次（进程内缓存 30 分钟）。
+ * 没权限/没房间 ⇒ 返回空数组，主流程照跑。 */
+const smallCache = new Map();          // uid -> { at, list:[{ch,name}] }
+async function smallChannels(w) {
+  const hit = smallCache.get(w.uid);
+  if (hit && Date.now() - hit.at < 30 * 60e3) return hit.list;
+  let list = [];
+  try {
+    const j = await postJson('/im/api/seine/server/detail', { serverId: Number(w.srv) }, { token: TOKEN, retries: 1 });
+    const c = (j && j.content) || {};
+    list = (c.channelInfoList || [])
+      .map((x) => ({ ch: String(x.channelId || ''), name: String(x.channelName || '') }))
+      .filter((x) => x.ch && x.ch !== String(w.ch));
+  } catch (e) {
+    log(`${w.nick} 查小房间失败（本轮只播大房间）：` + String((e && e.message) || e).slice(0, 70));
+  }
+  smallCache.set(w.uid, { at: Date.now(), list });
+  return list;
 }
 
 /* ---------------- 一轮（单个成员） ----------------
@@ -337,7 +363,7 @@ async function tickOne(w, st, lives, first) {
         这种情况**只播开播/下播**，不要去拉房间（拉必报错，日志会被刷满，还白等超时）。 */
   const now = Date.now();
   // 游标为空（第一次跑）或落后太多 ⇒ 只补最近 10 分钟，绝不把整段历史倒进群
-  const floor = now - 10 * 60e3;
+  const floor = now - Math.max(1, Number(process.env.WX_SINCE_MIN) || 10) * 60e3;
   const since = Math.max(Number(st.roomT) || 0, floor);
   if (!w.srv || !w.ch) {
     if (first) log(`${w.nick}：没有房间号（srv/ch），本轮只播开播/下播`);
@@ -372,6 +398,43 @@ async function tickOne(w, st, lives, first) {
   } catch (e) {
     next.err = 'room:' + String(e.message || e).slice(0, 60);
     log(`${w.nick} 查房间消息失败：` + next.err);
+  }
+
+  /* ②b 小房间（同上逻辑，游标按频道分开存 `sm<ch>`，文案标「·小房间」）。
+     能不能看到取决于**这个账号进没进那间房** —— 没进就是 0 条，不报错。 */
+  if (w.srv && w.ch) try {
+    const scs = await smallChannels(w);
+    if (first) log(`${w.nick}：小房间 ${scs.length ? scs.map((x) => x.ch + (x.name ? '〈' + x.name + '〉' : '')).join('、') : '无（账号没进 / 她没有小房间）'}`);
+    for (const sc of scs) {
+      const key = 'sm' + sc.ch;
+      const s0 = Math.max(Number(st[key]) || 0, floor);
+      const msgs = await collect(s0, w, sc.ch);
+      if (msgs.length) {
+        const newest = msgs[msgs.length - 1].t;
+        const label = `【${w.nick}·小房间】`;
+        if (msgs.length === 1) {
+          add('small:' + w.uid + ':' + sc.ch + ':' + msgs[0].t, msgs[0].t,
+            `${label}${bjTime(msgs[0].t)}\n${msgs[0].text}`);
+        } else {
+          const lines = msgs.map((it) => `${bjTime(it.t, false)}  ${it.text}`).join('\n');
+          add('small:' + w.uid + ':' + sc.ch + ':' + newest, newest,
+            `${label}${msgs.length} 条新消息\n${lines}`);
+        }
+        next[key] = newest;
+        active = true;
+        acts.push(msgs[0].t, newest);
+        if (!next.lastKind) next.lastKind = /^\[翻牌\]/.test(msgs[0].text) ? 'flip' : 'msg';
+        log(`小房间消息 ${msgs.length} 条（${sc.name || sc.ch}），最新 ${bjTime(newest)}`);
+        for (const im of msgs.filter((x) => x.img)) {
+          add('smallimg:' + w.uid + ':' + sc.ch + ':' + im.t, im.t, '', im.img);
+        }
+      } else if (!st[key] || Number(st[key]) < floor) {
+        next[key] = now;
+      }
+    }
+  } catch (e) {
+    next.err = 'small:' + String(e.message || e).slice(0, 60);
+    log(`${w.nick} 查小房间失败：` + next.err);
   }
 
   /* ③ 上下线 —— 站长口径（2026-11-12 18:5x 最终版）：**静默 5 分钟算下线**。
