@@ -218,9 +218,24 @@ function line(m) {
   /* 🔴 翻牌（FLIPCARD_AUDIO / FLIPCARD_VIDEO）以前直接落到 else 被丢掉，
      2026-11-12 补上：翻牌是她最主动的动作之一，也是「上线」的重要信号。
      真实文本藏在 bodys 里，字段名三种写法都遇到过 ⇒ 统一交给 pickText 挖。 */
-  else if (/^FLIPCARD/i.test(type) || type === 'AUDIO_GIFT_REPLY') {
-    const txt = pickText(body);
-    content = '[翻牌]' + (txt ? ' ' + txt : '');
+  else if (/^FLIPCARD/i.test(type) || type === 'REPLY' || type === 'AUDIO_GIFT_REPLY') {
+    /* 🔴 2026-11-14 修：新版翻牌类型是 **REPLY**（不是 FLIPCARD_*），以前落到 else 被整条丢掉
+       ⇒ 她 15:14 连回 4 条翻牌，群里一条都没有，也没算「上线」。
+       正文字段实测（曾雪婷 11-14 13:34 REPLY）：
+         bodys.replyInfo = { replyText: 粉丝的原话, text: 她自己的回答 }
+       反过来写过一次就错，别改。 */
+    let b = {};
+    try { b = JSON.parse(body || '{}'); } catch { b = {}; }
+    const info = b.replyInfo || b.giftReplyInfo || {};
+    const ans = String(info.text || info.answer || '').trim();
+    const q = String(info.replyText || info.question || '').trim();
+    if (type === 'AUDIO_GIFT_REPLY') {
+      content = '[语音翻牌]' + (q ? ' ' + q : '');
+    } else {
+      const txt = (ans || pickText(body) || q).slice(0, 120);
+      content = '[翻牌]' + (txt ? ' ' + txt : '');
+      if (txt && q && q !== txt) content += '（问：' + q.slice(0, 60) + '）';
+    }
   }
   else if (type === 'AUDIO' || type === 'VOICE') {
     let sec = 0;
